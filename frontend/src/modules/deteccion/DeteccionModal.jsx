@@ -323,30 +323,42 @@ export function DeteccionModal({ isOpen, onClose, onApply }) {
                   <thead>
                     <tr style={{ borderBottom: '2px solid var(--border, #e0e0e0)' }}>
                       <th style={thStyle('#888', '18%')}>Campo</th>
-                      {MOTORES.map((m) => (
-                        <th key={m.key} style={{ ...thStyle(m.color, '27%'), position: 'relative' }}>
-                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '6px' }}>
-                            <span>{m.label}</span>
-                            <button
-                              type="button"
-                              onClick={() => handleUsarDatos(m.key)}
-                              style={{
-                                fontSize: '0.7rem',
-                                padding: '2px 8px',
-                                border: `1px solid ${m.color}`,
-                                borderRadius: '10px',
-                                background: 'transparent',
-                                color: m.color,
-                                cursor: 'pointer',
-                                fontWeight: 600,
-                                whiteSpace: 'nowrap',
-                              }}
-                            >
-                              Usar
-                            </button>
-                          </div>
-                        </th>
-                      ))}
+                      {MOTORES.map((m) => {
+                        const engineError = resultado[m.key]?._engine_error || null;
+                        return (
+                          <th key={m.key} style={{ ...thStyle(m.color, '27%'), position: 'relative' }}>
+                            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '6px' }}>
+                              <div>
+                                <span>{m.label}</span>
+                                {engineError && (
+                                  <div style={{ fontSize: '0.62rem', color: '#999', fontWeight: 400, textTransform: 'none', marginTop: '2px' }}>
+                                    No disponible en este sistema
+                                  </div>
+                                )}
+                              </div>
+                              {!engineError && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleUsarDatos(m.key)}
+                                  style={{
+                                    fontSize: '0.7rem',
+                                    padding: '2px 8px',
+                                    border: `1px solid ${m.color}`,
+                                    borderRadius: '10px',
+                                    background: 'transparent',
+                                    color: m.color,
+                                    cursor: 'pointer',
+                                    fontWeight: 600,
+                                    whiteSpace: 'nowrap',
+                                  }}
+                                >
+                                  Usar
+                                </button>
+                              )}
+                            </div>
+                          </th>
+                        );
+                      })}
                       {/* Columna RENIEC deshabilitada — preservada para uso futuro
                       <th style={thStyle('#1a6fa0', '0%')}>
                         RENIEC
@@ -361,18 +373,21 @@ export function DeteccionModal({ isOpen, onClose, onApply }) {
                   </thead>
                   <tbody>
                     {Object.entries(LABELS_DNI).map(([key, label]) => {
-                      const vals = MOTORES.map((m) => resultado[m.key]?.[key] || null);
                       // const reniecVal = RENIEC_MAP[key]?.(resultado.reniec) || null;  // deshabilitado
                       return (
                         <tr key={key} style={{ borderBottom: '1px solid var(--border, #eee)' }}>
                           <td style={{ padding: '7px 10px', color: '#888', whiteSpace: 'nowrap', fontSize: '0.82rem' }}>
                             {label}
                           </td>
-                          {vals.map((v, i) => (
-                            <td key={MOTORES[i].key} style={cellStyle(v)}>
-                              {v || 'No detectado'}
-                            </td>
-                          ))}
+                          {MOTORES.map((m) => {
+                            const engineError = resultado[m.key]?._engine_error || null;
+                            const v = engineError ? null : (resultado[m.key]?.[key] || null);
+                            return (
+                              <td key={m.key} style={{ ...cellStyle(v), color: engineError ? '#ddd' : cellStyle(v).color }}>
+                                {engineError ? '—' : (v || 'No detectado')}
+                              </td>
+                            );
+                          })}
                           {/* Celda RENIEC deshabilitada — preservada para uso futuro
                           <td style={{ display: 'none', ...cellStyle(reniecVal) }}>
                             {reniecVal || (resultado.reniec ? '—' : 'Sin consulta')}

@@ -23,6 +23,7 @@ except Exception:
 
 
 pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+# pytesseract.pytesseract.tesseract_cmd = "/opt/homebrew/bin/tesseract"
 
 # ── Lazy loaders para motores alternativos (easyocr, paddleocr) ────────────
 # Se inicializan solo cuando se necesitan para no penalizar el arranque.
@@ -44,15 +45,24 @@ def _get_easyocr():
 def _get_paddleocr():
     global _paddle_ocr_instance
     if _paddle_ocr_instance is None:
+        # Bug conocido: PaddlePaddle 3.x en Windows usa oneDNN con PIR, lo que falla
+        # con ciertos modelos. Deshabilitar PIR antes de importar paddle.
+        import os  # noqa: PLC0415
+        os.environ.setdefault('FLAGS_enable_pir_api', '0')
         for lang in ('es', 'latin', 'en'):
-            # PaddleOCR v3 (paddlex) — solo necesita lang
+            # PaddleOCR v3 (paddlex) sin clasificadores de orientacion (evitar el bug oneDNN)
             try:
                 from paddleocr import PaddleOCR  # noqa: PLC0415
-                _paddle_ocr_instance = PaddleOCR(lang=lang)
+                _paddle_ocr_instance = PaddleOCR(
+                    lang=lang,
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                    use_textline_orientation=False,
+                )
                 break
             except Exception:
                 pass
-            # PaddleOCR v2 — API clásica con parámetros adicionales
+            # PaddleOCR v2 — API clásica
             try:
                 from paddleocr import PaddleOCR  # noqa: PLC0415
                 _paddle_ocr_instance = PaddleOCR(
@@ -525,21 +535,40 @@ def _buscar_valor_derecha(palabras, etiquetas, dist_max=700, tol_y=22):
     return None
 
 
-def _buscar_valor_abajo(palabras, etiquetas, dist_max=90, tol_x=350):
+def _agrupar_en_lineas(palabras_sorted, tol_y=20):
+    """Agrupa palabras (ya ordenadas por y) en líneas según proximidad vertical."""
+    if not palabras_sorted:
+        return []
+    lineas, grupo = [], [palabras_sorted[0]]
+    for q in palabras_sorted[1:]:
+        if abs(q["y"] - grupo[-1]["y"]) < tol_y:
+            grupo.append(q)
+        else:
+            lineas.append(grupo)
+            grupo = [q]
+    lineas.append(grupo)
+    return lineas
+
+
+def _buscar_valor_abajo(palabras, etiquetas, dist_max=220, tol_x=400):
     etiquetas_up = [e.upper() for e in etiquetas]
     for p in palabras:
-        if any(e in p["texto"].upper() for e in etiquetas_up):
-            candidatos = sorted(
-                [q for q in palabras
-                 if q["y"] > p["y"]
-                 and (q["y"] - p["y"]) < dist_max
-                 and abs(q["x"] - p["x"]) < tol_x],
-                key=lambda x: x["y"]
-            )
-            if candidatos:
-                texto_val = " ".join(c["texto"] for c in candidatos)
-                if not _es_etiqueta_dni(texto_val):
-                    return texto_val
+        if not any(e in p["texto"].upper() for e in etiquetas_up):
+            continue
+        candidatos = sorted(
+            [q for q in palabras
+             if q["y"] > p["y"]
+             and (q["y"] - p["y"]) < dist_max
+             and abs(q["x"] - p["x"]) < tol_x],
+            key=lambda x: (x["y"], x["x"])
+        )
+        if not candidatos:
+            continue
+        # Iterar línea por línea y devolver la primera que no sea etiqueta de DNI
+        for linea in _agrupar_en_lineas(candidatos):
+            texto_linea = " ".join(c["texto"] for c in sorted(linea, key=lambda x: x["x"]))
+            if not _es_etiqueta_dni(texto_linea):
+                return texto_linea
     return None
 
 
@@ -664,60 +693,92 @@ def _extraer_codigo_verificador(texto, palabras):
     return None
 
 
+def _limpiar_valor_nombre(v: str | None) -> str | None:
+    """Elimina palabras-etiqueta del DNI que se cuelen en el valor extraído."""
+    if not v:
+        return None
+    v = _corregir_nombre(v)
+    if not v:
+        return None
+    # Quitar tokens que sean etiquetas puras (ej. "APELLIDO" que OCR incluyó en la línea)
+    tokens = [p for p in v.split() if p.upper() not in _ETIQUETAS_DNI]
+    return " ".join(tokens) if tokens else None
+
+
 def _extraer_apellidos(texto, palabras):
     paterno, materno = None, None
 
     for etq in ["PRIMER", "Primer"]:
         v = _buscar_valor_abajo(palabras, [etq], dist_max=220, tol_x=400)
-        if v:
-            v = _corregir_nombre(v)
-            if v and not _es_etiqueta_dni(v) and len(v) >= 2:
-                paterno = v
-                break
+        v = _limpiar_valor_nombre(v)
+        if v and len(v) >= 2:
+            paterno = v
+            break
 
     for etq in ["SEGUNDO", "Segundo"]:
         v = _buscar_valor_abajo(palabras, [etq], dist_max=220, tol_x=400)
-        if v:
-            v = _corregir_nombre(v)
-            if v and not _es_etiqueta_dni(v) and len(v) >= 2:
-                materno = v
-                break
+        v = _limpiar_valor_nombre(v)
+        if v and len(v) >= 2:
+            materno = v
+            break
 
     if not paterno:
         v = _buscar_valor_abajo(palabras, ["APELLIDOS", "APELLIDO"], dist_max=220, tol_x=400)
+        v = _limpiar_valor_nombre(v)
         if v:
-            v = _corregir_nombre(v)
-            if v:
-                partes = v.split()
-                paterno = partes[0] if partes else None
-                if not materno:
-                    materno = partes[1] if len(partes) > 1 else None
+            partes = v.split()
+            paterno = partes[0] if partes else None
+            if not materno:
+                materno = partes[1] if len(partes) > 1 else None
 
+    # Regex con variantes: multilinea, con y sin dos puntos, orden alternativo
+    _RE_AP1 = [
+        r"PRIMER\s+APELLIDO\s*[:\-]?\s*\n?\s*([A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ ]+)",
+        r"APELLIDO\s+PATERNO\s*[:\-]?\s*\n?\s*([A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ ]+)",
+        r"1[Ee][Rr]\.?\s+APELLIDO\s*[:\-]?\s*\n?\s*([A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ ]+)",
+    ]
+    _RE_AP2 = [
+        r"SEGUNDO\s+APELLIDO\s*[:\-]?\s*\n?\s*([A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ ]+)",
+        r"APELLIDO\s+MATERNO\s*[:\-]?\s*\n?\s*([A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ ]+)",
+        r"2[Dd][Oo]\.?\s+APELLIDO\s*[:\-]?\s*\n?\s*([A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ ]+)",
+    ]
     if not paterno:
-        m = re.search(r"PRIMER\s+APELLIDO\s*[:\-]?\s*([A-ZÁÉÍÓÚÜÑA-Z ]+)", texto, re.I)
-        if m:
-            paterno = _corregir_nombre(m.group(1))
+        for pat in _RE_AP1:
+            m = re.search(pat, texto, re.I)
+            if m:
+                paterno = _limpiar_valor_nombre(m.group(1))
+                if paterno:
+                    break
     if not materno:
-        m = re.search(r"SEGUNDO\s+APELLIDO\s*[:\-]?\s*([A-ZÁÉÍÓÚÜÑA-Z ]+)", texto, re.I)
-        if m:
-            materno = _corregir_nombre(m.group(1))
+        for pat in _RE_AP2:
+            m = re.search(pat, texto, re.I)
+            if m:
+                materno = _limpiar_valor_nombre(m.group(1))
+                if materno:
+                    break
 
     return paterno, materno
 
 
 def _extraer_nombres(texto, palabras):
     v = _buscar_valor_abajo(palabras, ["NOMBRES", "NOMBRE"], dist_max=220, tol_x=400)
-    if v:
-        v = _corregir_nombre(v)
-        if v and not _es_etiqueta_dni(v):
-            return v
+    v = _limpiar_valor_nombre(v)
+    if v and not _es_etiqueta_dni(v):
+        return v
     v = _buscar_valor_derecha(palabras, ["NOMBRES", "NOMBRE"], dist_max=700, tol_y=35)
-    if v:
-        v = _corregir_nombre(v)
-        if v and not _es_etiqueta_dni(v):
-            return v
-    m = re.search(r"NOMBRES?\s*[:\-]?\s*([A-ZÁÉÍÓÚÜÑA-Z ]+)", texto, re.IGNORECASE)
-    return _corregir_nombre(m.group(1)) if m else None
+    v = _limpiar_valor_nombre(v)
+    if v and not _es_etiqueta_dni(v):
+        return v
+    for pat in [
+        r"NOMBRES?\s*[:\-]?\s*\n?\s*([A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ ]+)",
+        r"NOMBRE\s+COMPLETO\s*[:\-]?\s*\n?\s*([A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ ]+)",
+    ]:
+        m = re.search(pat, texto, re.IGNORECASE)
+        if m:
+            v = _limpiar_valor_nombre(m.group(1))
+            if v:
+                return v
+    return None
 
 
 _RE_FECHA = re.compile(r'(\d{2})[\s\/\-\.](\d{2})[\s\/\-\.](\d{4})')
@@ -987,17 +1048,20 @@ def _campos_engine_easyocr(img_sin_azul, mrz, numero_pillow, texto_pillow='') ->
 def _campos_engine_paddleocr(img_sin_azul, mrz, numero_pillow, texto_pillow='') -> dict:
     ocr_inst = _get_paddleocr()
     if not ocr_inst:
-        return _campos_vacios()
+        c = _campos_vacios()
+        c['_engine_error'] = 'PaddleOCR no disponible en este sistema'
+        return c
     try:
-        # PaddleOCR v3+ usa predict(), v2.x usa ocr()
         try:
             resultados = ocr_inst.predict(img_sin_azul)
         except AttributeError:
             resultados = ocr_inst.ocr(img_sin_azul)
         palabras = _palabras_desde_paddleocr(resultados)
         return _extraer_campos_dni(palabras, mrz, numero_pillow, texto_extra=texto_pillow)
-    except Exception:
-        return _campos_vacios()
+    except Exception as e:
+        c = _campos_vacios()
+        c['_engine_error'] = str(e)[:120]
+        return c
 
 
 def _consultar_reniec(numero_dni: str) -> dict | None:
