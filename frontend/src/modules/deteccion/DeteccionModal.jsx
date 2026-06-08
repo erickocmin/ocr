@@ -26,7 +26,7 @@ const LABELS_CARNET = {
   sexo:             'Sexo',
 };
 
-// Extrae el campo RENIEC equivalente para cada campo OCR
+// RENIEC_MAP — deshabilitado en UI por ahora, preservado para implementación futura
 const RENIEC_MAP = {
   apellido_paterno:   (r) => r?.apellidoPaterno   || null,
   apellido_materno:   (r) => r?.apellidoMaterno   || null,
@@ -35,6 +35,12 @@ const RENIEC_MAP = {
 };
 
 const INITIAL_LOGIN = { username: '', password: '' };
+
+const MOTORES = [
+  { key: 'tesseract', label: 'Tesseract',  color: '#555' },
+  { key: 'easyocr',   label: 'EasyOCR',   color: '#1a7a4a' },
+  { key: 'paddleocr', label: 'PaddleOCR', color: '#8b1fa0' },
+];
 
 function getStoredToken() {
   return sessionStorage.getItem(TOKEN_KEY) || '';
@@ -50,6 +56,14 @@ function thStyle(color, width) {
     fontSize: '0.78rem',
     textTransform: 'uppercase',
     letterSpacing: '0.04em',
+  };
+}
+
+function cellStyle(val) {
+  return {
+    padding: '7px 10px',
+    color: val ? 'inherit' : '#bbb',
+    fontSize: '0.85rem',
   };
 }
 
@@ -149,17 +163,17 @@ export function DeteccionModal({ isOpen, onClose, onApply }) {
     }
   }
 
-  function handleUsarDatos() {
+  // motor: 'tesseract' | 'easyocr' | 'paddleocr'  (DNI)
+  // motor: null  (Carnet — usa resultado.campos)
+  function handleUsarDatos(motor) {
     if (!resultado) return;
-    const c = resultado.campos;
-    const r = resultado.reniec;
+    const c = motor ? (resultado[motor] || {}) : (resultado.campos || {});
     const socioData = {};
 
     if (tipoDoc === 'DNI') {
-      // RENIEC tiene prioridad para datos personales; OCR para el resto
-      socioData.nombre   = r?.nombres         || c.nombres         || '';
-      const ap           = r?.apellidoPaterno || c.apellido_paterno || '';
-      const am           = r?.apellidoMaterno || c.apellido_materno || '';
+      socioData.nombre   = c.nombres          || '';
+      const ap           = c.apellido_paterno || '';
+      const am           = c.apellido_materno || '';
       socioData.apellido = [ap, am].filter(Boolean).join(' ');
     } else {
       if (c.nombre)    socioData.nombre   = c.nombre;
@@ -170,7 +184,6 @@ export function DeteccionModal({ isOpen, onClose, onApply }) {
     handleClose();
   }
 
-  const labels   = tipoDoc === 'DNI' ? LABELS_DNI : LABELS_CARNET;
   const hasToken = !!token;
 
   return (
@@ -296,47 +309,106 @@ export function DeteccionModal({ isOpen, onClose, onApply }) {
           </div>
         </div>
       ) : (
-        /* Resultados con columnas OCR | RENIEC */
+        /* Resultados */
         <div>
-          <p style={{ margin: '0 0 14px', color: 'var(--text-muted, #666)', fontSize: '0.85rem' }}>
-            Al usar los datos, los campos personales (apellidos y nombre) se toman de RENIEC cuando están disponibles.
-          </p>
+          {tipoDoc === 'DNI' ? (
+            /* DNI — 3 columnas: Tesseract | EasyOCR | PaddleOCR */
+            <>
+              <p style={{ margin: '0 0 12px', color: 'var(--text-muted, #666)', fontSize: '0.83rem' }}>
+                Compara los 3 motores y usa los datos del que mejor detectó.
+              </p>
 
-          <div style={{ overflowX: 'auto' }}>
-            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.875rem' }}>
-              <thead>
-                <tr style={{ borderBottom: '2px solid var(--border, #e0e0e0)' }}>
-                  <th style={thStyle('#888', '25%')}>Campo</th>
-                  <th style={thStyle('#555', '37%')}>OCR (imagen)</th>
-                  <th style={thStyle('#1a6fa0', '38%')}>
-                    RENIEC
-                    {resultado.reniec && (
-                      <span style={{ fontSize: '0.68rem', marginLeft: '6px', padding: '1px 7px', borderRadius: '10px', background: '#e8f4fd', color: '#1a6fa0', border: '1px solid #b3d9f5', fontWeight: 400 }}>
-                        verificado
-                      </span>
-                    )}
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
-                {Object.entries(labels).map(([key, label]) => {
-                  const ocrVal    = resultado.campos[key] || null;
-                  const reniecVal = RENIEC_MAP[key]?.(resultado.reniec) || null;
-                  return (
-                    <tr key={key} style={{ borderBottom: '1px solid var(--border, #eee)' }}>
-                      <td style={{ padding: '7px 10px', color: '#888', whiteSpace: 'nowrap' }}>{label}</td>
-                      <td style={{ padding: '7px 10px', color: ocrVal ? 'inherit' : '#bbb' }}>
-                        {ocrVal || 'No detectado'}
-                      </td>
-                      <td style={{ padding: '7px 10px', color: reniecVal ? '#1558a0' : '#bbb', fontWeight: reniecVal ? 600 : 400 }}>
-                        {reniecVal || (resultado.reniec ? '—' : 'Sin consulta')}
-                      </td>
+              <div style={{ overflowX: 'auto' }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.85rem' }}>
+                  <thead>
+                    <tr style={{ borderBottom: '2px solid var(--border, #e0e0e0)' }}>
+                      <th style={thStyle('#888', '18%')}>Campo</th>
+                      {MOTORES.map((m) => (
+                        <th key={m.key} style={{ ...thStyle(m.color, '27%'), position: 'relative' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '6px' }}>
+                            <span>{m.label}</span>
+                            <button
+                              type="button"
+                              onClick={() => handleUsarDatos(m.key)}
+                              style={{
+                                fontSize: '0.7rem',
+                                padding: '2px 8px',
+                                border: `1px solid ${m.color}`,
+                                borderRadius: '10px',
+                                background: 'transparent',
+                                color: m.color,
+                                cursor: 'pointer',
+                                fontWeight: 600,
+                                whiteSpace: 'nowrap',
+                              }}
+                            >
+                              Usar
+                            </button>
+                          </div>
+                        </th>
+                      ))}
+                      {/* Columna RENIEC deshabilitada — preservada para uso futuro
+                      <th style={thStyle('#1a6fa0', '0%')}>
+                        RENIEC
+                        {resultado.reniec && (
+                          <span style={{ fontSize: '0.68rem', marginLeft: '6px', padding: '1px 7px', borderRadius: '10px', background: '#e8f4fd', color: '#1a6fa0', border: '1px solid #b3d9f5', fontWeight: 400 }}>
+                            verificado
+                          </span>
+                        )}
+                      </th>
+                      */}
                     </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
+                  </thead>
+                  <tbody>
+                    {Object.entries(LABELS_DNI).map(([key, label]) => {
+                      const vals = MOTORES.map((m) => resultado[m.key]?.[key] || null);
+                      // const reniecVal = RENIEC_MAP[key]?.(resultado.reniec) || null;  // deshabilitado
+                      return (
+                        <tr key={key} style={{ borderBottom: '1px solid var(--border, #eee)' }}>
+                          <td style={{ padding: '7px 10px', color: '#888', whiteSpace: 'nowrap', fontSize: '0.82rem' }}>
+                            {label}
+                          </td>
+                          {vals.map((v, i) => (
+                            <td key={MOTORES[i].key} style={cellStyle(v)}>
+                              {v || 'No detectado'}
+                            </td>
+                          ))}
+                          {/* Celda RENIEC deshabilitada — preservada para uso futuro
+                          <td style={{ display: 'none', ...cellStyle(reniecVal) }}>
+                            {reniecVal || (resultado.reniec ? '—' : 'Sin consulta')}
+                          </td>
+                          */}
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          ) : (
+            /* Carnet — columna única OCR */
+            <div style={{ overflowX: 'auto' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.875rem' }}>
+                <thead>
+                  <tr style={{ borderBottom: '2px solid var(--border, #e0e0e0)' }}>
+                    <th style={thStyle('#888', '35%')}>Campo</th>
+                    <th style={thStyle('#555', '65%')}>OCR (imagen)</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {Object.entries(LABELS_CARNET).map(([key, label]) => {
+                    const v = resultado.campos?.[key] || null;
+                    return (
+                      <tr key={key} style={{ borderBottom: '1px solid var(--border, #eee)' }}>
+                        <td style={{ padding: '7px 10px', color: '#888', whiteSpace: 'nowrap' }}>{label}</td>
+                        <td style={cellStyle(v)}>{v || 'No detectado'}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
 
           {error && (
             <div style={{ color: 'var(--danger, #c0392b)', fontSize: '0.88rem', marginTop: '12px' }}>
@@ -348,9 +420,11 @@ export function DeteccionModal({ isOpen, onClose, onApply }) {
             <button type="button" className="btn btn-ghost" onClick={() => { setResultado(null); setError(''); }}>
               Detectar otra imagen
             </button>
-            <button type="button" className="btn btn-primary" onClick={handleUsarDatos}>
-              Usar datos para nuevo socio
-            </button>
+            {tipoDoc !== 'DNI' && (
+              <button type="button" className="btn btn-primary" onClick={() => handleUsarDatos(null)}>
+                Usar datos para nuevo socio
+              </button>
+            )}
           </div>
         </div>
       )}

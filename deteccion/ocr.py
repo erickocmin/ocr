@@ -13,8 +13,55 @@ try:
 except ImportError:
     OCR_DISPONIBLE = False
 
+# fastmrz: MRZ con modelos ONNX + validación de checksum ICAO (pip install fastmrz)
+try:
+    from fastmrz import FastMRZ as _FastMRZ
+    _fast_mrz = _FastMRZ()
+    FASTMRZ_DISPONIBLE = True
+except Exception:
+    FASTMRZ_DISPONIBLE = False
+
 
 pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
+# ── Lazy loaders para motores alternativos (easyocr, paddleocr) ────────────
+# Se inicializan solo cuando se necesitan para no penalizar el arranque.
+_easy_ocr_reader   = None
+_paddle_ocr_instance = None
+
+
+def _get_easyocr():
+    global _easy_ocr_reader
+    if _easy_ocr_reader is None:
+        try:
+            import easyocr  # noqa: PLC0415
+            _easy_ocr_reader = easyocr.Reader(['es', 'en'], gpu=False, verbose=False)
+        except Exception:
+            pass
+    return _easy_ocr_reader
+
+
+def _get_paddleocr():
+    global _paddle_ocr_instance
+    if _paddle_ocr_instance is None:
+        for lang in ('es', 'latin', 'en'):
+            # PaddleOCR v3 (paddlex) — solo necesita lang
+            try:
+                from paddleocr import PaddleOCR  # noqa: PLC0415
+                _paddle_ocr_instance = PaddleOCR(lang=lang)
+                break
+            except Exception:
+                pass
+            # PaddleOCR v2 — API clásica con parámetros adicionales
+            try:
+                from paddleocr import PaddleOCR  # noqa: PLC0415
+                _paddle_ocr_instance = PaddleOCR(
+                    lang=lang, use_angle_cls=True, show_log=False, use_gpu=False
+                )
+                break
+            except Exception:
+                continue
+    return _paddle_ocr_instance
 
 _RENIEC_TOKEN = os.getenv('RENIEC_TOKEN', 'apis-token-16099.nd0kCbthWLqfHqL04GbpyY3e8OE83L5G')
 _RENIEC_URL = 'https://api.apis.net.pe/v2/reniec/dni'
@@ -29,8 +76,6 @@ _ETIQUETAS_DNI = {
 _DIGIT_A_LETRA = str.maketrans("015348672", "OISAEBGZA")
 
 
-# ── Carga y preprocesamiento de imagen ────────────────────────────────────
-
 def _bytes_a_bgr(imagen_bytes: bytes):
     arr = np.frombuffer(imagen_bytes, np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -40,10 +85,6 @@ def _bytes_a_bgr(imagen_bytes: bytes):
 
 
 def _rotar_si_necesario(img_bgr):
-    """
-    Auto-rotación solo si Tesseract OSD tiene alta confianza (>=4.0).
-    Evita rotar imágenes ya correctamente orientadas.
-    """
     try:
         gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
         osd = pytesseract.image_to_osd(gray, output_type=pytesseract.Output.DICT)
@@ -62,11 +103,6 @@ def _rotar_si_necesario(img_bgr):
 
 
 def _corregir_perspectiva(img_bgr):
-    """
-    Corrección de perspectiva usando detección del contorno de la tarjeta.
-    Solo se aplica cuando el contorno detectado cubre >=35% del área y tiene
-    ratio de aspecto plausible para un DNI (1.3-2.0).
-    """
     h, w = img_bgr.shape[:2]
     area_total = h * w
 
@@ -136,6 +172,23 @@ def _deskew(img):
                           borderMode=cv2.BORDER_REPLICATE)
 
 
+def _eliminar_franja_azul(img_bgr):
+    """
+    Elimina la franja azul vertical izquierda del DNI peruano usando HSV masking.
+    Esta franja contiene el número DNI impreso verticalmente y es la causa principal
+    de que el OCR encuentre el número en la posición incorrecta del texto.
+    Rango HSV azul: H=[95-135], S=[50-255], V=[30-255]
+    """
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    mask_azul = cv2.inRange(hsv, np.array([95, 50, 30]), np.array([135, 255, 255]))
+    # Dilatar para cubrir bordes antialiased de la franja
+    kernel = np.ones((7, 7), np.uint8)
+    mask_azul = cv2.dilate(mask_azul, kernel, iterations=1)
+    resultado = img_bgr.copy()
+    resultado[mask_azul > 0] = [255, 255, 255]
+    return resultado
+
+
 def _preprocesar_zona(img_bgr):
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     gray = cv2.fastNlMeansDenoising(gray, h=12)
@@ -148,8 +201,6 @@ def _preprocesar_zona(img_bgr):
                                    cv2.THRESH_BINARY, 31, 10)
     return cv2.bitwise_or(otsu, adapt)
 
-
-# ── Preprocesamiento Pillow (original — confiable para número DNI) ────────
 
 def _texto_pillow_variante(imagen_bytes: bytes, contrast: float = 2.0,
                            brightness: float = 1.0) -> str:
@@ -164,7 +215,6 @@ def _texto_pillow_variante(imagen_bytes: bytes, contrast: float = 2.0,
     return pytesseract.image_to_string(img, config='--oem 3 --psm 6 -l spa+eng')
 
 
-# ── Zonas de interés ───────────────────────────────────────────────────────
 
 def _recortar(img_bgr, x1r, y1r, x2r, y2r):
     h, w = img_bgr.shape[:2]
@@ -191,8 +241,6 @@ def _zona_mrz(img_bgr):
     return normal, cv2.bitwise_not(normal)
 
 
-# ── OCR con bounding boxes ─────────────────────────────────────────────────
-
 def _obtener_datos_ocr(img):
     mejor_datos, mejor_score = None, -1
     for psm in ("6", "4", "3"):
@@ -206,7 +254,7 @@ def _obtener_datos_ocr(img):
                 score = sum(c for c in confs if c >= 50) / (len(confs) + 1) if confs else 0
                 if score > mejor_score:
                     mejor_score, mejor_datos = score, datos
-                break  # si este lang funciono, no probar el siguiente
+                break
             except Exception:
                 continue
     if mejor_datos is None:
@@ -267,8 +315,6 @@ def _texto_completo(palabras):
     lineas.append(sorted(linea_actual, key=lambda x: x["x"]))
     return "\n".join(" ".join(p["texto"] for p in l) for l in lineas)
 
-
-# ── MRZ ────────────────────────────────────────────────────────────────────
 
 def _score_mrz(texto):
     score = texto.count("<") * 3
@@ -354,6 +400,60 @@ def _nombre_mrz_valido(texto) -> bool:
     return bool(re.search(r'[A-ZÁÉÍÓÚÜÑ]', texto))
 
 
+def _parsear_mrz_fastmrz(imagen_bytes: bytes) -> dict | None:
+    """
+    MRZ usando fastmrz con modelos ONNX y checksum ICAO.
+    - input_type='numpy': acepta array numpy BGR directo
+    - Retorna status='SUCCESS' cuando los checksums son validos
+    - Keys TD1: document_number, surname, given_name, birth_date, sex, expiry_date
+    """
+    if not FASTMRZ_DISPONIBLE:
+        return None
+    try:
+        arr = np.frombuffer(imagen_bytes, np.uint8)
+        img_np = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img_np is None:
+            return None
+
+        res = _fast_mrz.get_details(img_np, input_type='numpy')
+        if not res or res.get('status') != 'SUCCESS':
+            return None
+
+        # document_number puede tener padding '<' (ej: "46409361<" para 8 digitos)
+        doc_num  = str(res.get('document_number') or '').replace('<', '').strip()
+        apellido = str(res.get('surname')         or '').replace('<', ' ').strip()
+        nombres  = str(res.get('given_name')      or '').replace('<', ' ').strip()
+        nac_raw  = str(res.get('birth_date')      or '')
+        cad_raw  = str(res.get('expiry_date')     or '')
+        sexo     = str(res.get('sex')             or '')
+
+        partes_ap  = [p for p in apellido.split() if p and not _es_etiqueta_dni(p)]
+        nombres_ok = ' '.join(n for n in nombres.split() if n and not _es_etiqueta_dni(n))
+
+        # Normalizar fechas — fastmrz puede devolverlas como "DD/MM/YYYY" o "YYMMDD"
+        def _norm(raw):
+            solo_dig = re.sub(r'\D', '', raw)
+            if len(solo_dig) == 6:
+                return _mrz_fecha(solo_dig)
+            if len(solo_dig) == 8:
+                return f"{solo_dig[6:]}/{solo_dig[4:6]}/{solo_dig[:4]}"
+            if '/' in raw or '-' in raw:
+                return _normalizar_fecha(raw)
+            return None
+
+        return {
+            'numero_dni_mrz':       doc_num if len(doc_num) == 8 and doc_num.isdigit() else None,
+            'apellido_paterno_mrz': _corregir_nombre(partes_ap[0]) if partes_ap else None,
+            'apellido_materno_mrz': _corregir_nombre(partes_ap[1]) if len(partes_ap) > 1 else None,
+            'nombres_mrz':          _corregir_nombre(nombres_ok) if nombres_ok else None,
+            'fecha_nacimiento_mrz': _norm(nac_raw),
+            'sexo_mrz':             sexo if sexo in ('M', 'F') else None,
+            'fecha_caducidad_mrz':  _norm(cad_raw),
+        }
+    except Exception:
+        return None
+
+
 def _parsear_mrz(texto_mrz):
     if not texto_mrz:
         return None
@@ -381,7 +481,6 @@ def _parsear_mrz(texto_mrz):
         resultado["sexo_mrz"] = s if s in ("M", "F") else None
         resultado["fecha_caducidad_mrz"] = _mrz_fecha(linea2[8:14])
 
-    # Línea 3: APELLIDO(S)<<NOMBRE1<NOMBRE2 — separador << entre apellidos y nombres
     linea3 = next(
         (l for l in lineas if "<<" in l and l != linea2
          and not re.match(r"\d{6}\d[MF<]", l)),
@@ -409,7 +508,6 @@ def _parsear_mrz(texto_mrz):
     return resultado if resultado else None
 
 
-# ── Búsqueda espacial de campos ────────────────────────────────────────────
 
 def _buscar_valor_derecha(palabras, etiquetas, dist_max=700, tol_y=22):
     etiquetas_up = [e.upper() for e in etiquetas]
@@ -445,7 +543,6 @@ def _buscar_valor_abajo(palabras, etiquetas, dist_max=90, tol_x=350):
     return None
 
 
-# ── Extracción del número DNI ──────────────────────────────────────────────
 
 def _parece_fecha(s):
     return bool(re.match(r"^(0[1-9]|[12]\d|3[01])(0[1-9]|1[0-2])(19|20)\d{2}$", s))
@@ -460,13 +557,6 @@ def _limpiar_ocr_num(txt):
 
 
 def _extraer_numero_simple(lineas: list) -> str | None:
-    """
-    Extrae el número DNI de 8 dígitos del texto OCR.
-    Prioridad:
-    1. Patron "DNI XXXXXXXX-X" del encabezado (mas especifico)
-    2. Patron "DNI XXXXXXXX" sin digito verificador
-    3. Primer numero de 8 digitos que no sea fecha (fallback generico)
-    """
     texto = '\n'.join(lineas)
 
     m = re.search(r'\bDNI\s+(\d{8})\s*[-–]\s*\d', texto, re.IGNORECASE)
@@ -486,16 +576,35 @@ def _extraer_numero_simple(lineas: list) -> str | None:
 
 
 def _extraer_numero_multi_variante(imagen_bytes: bytes) -> str | None:
-    """Prueba multiples variantes de contraste/brillo para encontrar el numero DNI."""
-    for contrast, brightness in [(2.0, 1.0), (1.5, 1.2), (3.0, 0.9), (1.0, 1.0)]:
-        try:
-            texto = _texto_pillow_variante(imagen_bytes, contrast, brightness)
-            lineas = [l.strip() for l in texto.splitlines() if l.strip()]
-            resultado = _extraer_numero_simple(lineas)
-            if resultado:
-                return resultado
-        except Exception:
-            continue
+    """
+    Prueba multiples variantes para encontrar el numero DNI:
+    1. Imagen sin franja izquierda (elimina el numero vertical azul que confunde el OCR)
+    2. Imagen original con distintos contrastes/brillo
+    """
+    variantes = [(2.0, 1.0), (1.5, 1.2), (3.0, 0.9), (1.0, 1.0)]
+
+    # Generar version sin la franja izquierda (~13%) donde esta el numero vertical azul
+    try:
+        img_pil = Image.open(io.BytesIO(imagen_bytes))
+        w, h = img_pil.size
+        img_sin_izq = img_pil.crop((int(w * 0.13), 0, w, h))
+        buf = io.BytesIO()
+        img_sin_izq.save(buf, format='PNG')
+        imagen_sin_izq = buf.getvalue()
+    except Exception:
+        imagen_sin_izq = imagen_bytes
+
+    # Probar primero sin franja (mas fiable), luego imagen original
+    for img_b in [imagen_sin_izq, imagen_bytes]:
+        for contrast, brightness in variantes:
+            try:
+                texto = _texto_pillow_variante(img_b, contrast, brightness)
+                lineas = [l.strip() for l in texto.splitlines() if l.strip()]
+                resultado = _extraer_numero_simple(lineas)
+                if resultado:
+                    return resultado
+            except Exception:
+                continue
     return None
 
 
@@ -554,8 +663,6 @@ def _extraer_codigo_verificador(texto, palabras):
                     return cod
     return None
 
-
-# ── Extraccion de campos DNI ───────────────────────────────────────────────
 
 def _extraer_apellidos(texto, palabras):
     paterno, materno = None, None
@@ -720,7 +827,173 @@ def _extraer_ubigeo(texto, palabras):
     return None
 
 
-# ── RENIEC ─────────────────────────────────────────────────────────────────
+def _palabras_desde_easyocr(resultados) -> list:
+    """Convierte output de EasyOCR al formato interno de palabras con bounding boxes."""
+    palabras = []
+    for bbox, texto, conf in resultados:
+        if not texto.strip() or conf < 0.25:
+            continue
+        xs = [p[0] for p in bbox]
+        ys = [p[1] for p in bbox]
+        palabras.append({
+            "texto": texto.strip(),
+            "x":     int(min(xs)),
+            "y":     int(min(ys)),
+            "w":     int(max(xs) - min(xs)),
+            "h":     int(max(ys) - min(ys)),
+            "conf":  conf * 100,
+        })
+    return palabras
+
+
+def _palabras_desde_paddleocr(resultados) -> list:
+    """Convierte output de PaddleOCR (v2 o v3/paddlex) al formato interno."""
+    palabras = []
+    if not resultados:
+        return palabras
+
+    # PaddleOCR v3 (paddlex): [{'res': [{'dt_polys':..., 'rec_text':..., 'rec_score':...}]}]
+    if (isinstance(resultados, list) and resultados
+            and isinstance(resultados[0], dict) and 'res' in resultados[0]):
+        for page in resultados:
+            for item in page.get('res', []):
+                texto = item.get('rec_text', '').strip()
+                conf  = float(item.get('rec_score', 0.0))
+                bbox  = item.get('dt_polys', item.get('text_region', []))
+                if not texto or conf < 0.25 or not bbox:
+                    continue
+                try:
+                    xs = [p[0] for p in bbox]
+                    ys = [p[1] for p in bbox]
+                    palabras.append({
+                        "texto": texto,
+                        "x":     int(min(xs)),
+                        "y":     int(min(ys)),
+                        "w":     int(max(xs) - min(xs)),
+                        "h":     int(max(ys) - min(ys)),
+                        "conf":  conf * 100,
+                    })
+                except (TypeError, IndexError):
+                    continue
+        return palabras
+
+    # PaddleOCR v2: [[[bbox, (text, conf)], ...]]
+    for pagina in resultados:
+        if not pagina:
+            continue
+        for item in pagina:
+            try:
+                bbox, (texto, conf) = item
+            except (TypeError, ValueError):
+                continue
+            if not texto.strip() or conf < 0.25:
+                continue
+            xs = [p[0] for p in bbox]
+            ys = [p[1] for p in bbox]
+            palabras.append({
+                "texto": texto.strip(),
+                "x":     int(min(xs)),
+                "y":     int(min(ys)),
+                "w":     int(max(xs) - min(xs)),
+                "h":     int(max(ys) - min(ys)),
+                "conf":  conf * 100,
+            })
+    return palabras
+
+
+def _campos_vacios() -> dict:
+    return {k: None for k in (
+        'numero_dni', 'codigo_verificador', 'apellido_paterno', 'apellido_materno',
+        'nombres', 'fecha_nacimiento', 'sexo', 'estado_civil',
+        'ubigeo', 'fecha_emision', 'fecha_caducidad',
+    )}
+
+
+def _extraer_campos_dni(palabras: list, mrz: dict | None, numero_pillow: str | None) -> dict:
+    """Extrae todos los campos del DNI usando palabras con bounding boxes.
+    Reutilizable para cualquier motor OCR (Tesseract, EasyOCR, PaddleOCR)."""
+    if not palabras:
+        c = _campos_vacios()
+        c['numero_dni'] = numero_pillow
+        return c
+
+    texto = _texto_completo(palabras)
+    lineas = [l.strip() for l in texto.splitlines() if l.strip()]
+
+    numero_dni = _extraer_numero_simple(lineas)
+    if not numero_dni:
+        numero_dni = _extraer_numero_dni_spatial(texto, palabras, None)
+    if not numero_dni:
+        numero_dni = numero_pillow
+
+    apellido_paterno, apellido_materno = _extraer_apellidos(texto, palabras)
+    nombres = _extraer_nombres(texto, palabras)
+
+    if mrz:
+        ap_mrz = mrz.get('apellido_paterno_mrz')
+        am_mrz = mrz.get('apellido_materno_mrz')
+        n_mrz  = mrz.get('nombres_mrz')
+        if not apellido_paterno and _nombre_mrz_valido(ap_mrz):
+            apellido_paterno = ap_mrz
+        if not apellido_materno and _nombre_mrz_valido(am_mrz):
+            apellido_materno = am_mrz
+        if not nombres and _nombre_mrz_valido(n_mrz):
+            nombres = n_mrz
+
+    fecha_nac = _extraer_fecha_nacimiento(texto, palabras)
+    sexo      = _extraer_sexo(texto, palabras)
+    fecha_cad = _extraer_fecha_caducidad(texto, palabras)
+
+    if mrz:
+        if not fecha_nac:
+            fecha_nac = mrz.get('fecha_nacimiento_mrz')
+        if not sexo:
+            sexo = mrz.get('sexo_mrz')
+        if not fecha_cad:
+            fecha_cad = mrz.get('fecha_caducidad_mrz')
+
+    return {
+        'numero_dni':         numero_dni,
+        'codigo_verificador': _extraer_codigo_verificador(texto, palabras),
+        'apellido_paterno':   apellido_paterno,
+        'apellido_materno':   apellido_materno,
+        'nombres':            nombres,
+        'fecha_nacimiento':   fecha_nac,
+        'sexo':               sexo,
+        'estado_civil':       _extraer_estado_civil(texto, palabras),
+        'ubigeo':             _extraer_ubigeo(texto, palabras),
+        'fecha_emision':      _extraer_fecha_emision(texto, palabras),
+        'fecha_caducidad':    fecha_cad,
+    }
+
+
+def _campos_engine_easyocr(img_sin_azul, mrz, numero_pillow) -> dict:
+    reader = _get_easyocr()
+    if not reader:
+        return _campos_vacios()
+    try:
+        resultados = reader.readtext(img_sin_azul)
+        palabras = _palabras_desde_easyocr(resultados)
+        return _extraer_campos_dni(palabras, mrz, numero_pillow)
+    except Exception:
+        return _campos_vacios()
+
+
+def _campos_engine_paddleocr(img_sin_azul, mrz, numero_pillow) -> dict:
+    ocr_inst = _get_paddleocr()
+    if not ocr_inst:
+        return _campos_vacios()
+    try:
+        # PaddleOCR v3+ usa predict(), v2.x usa ocr()
+        try:
+            resultados = ocr_inst.predict(img_sin_azul)
+        except AttributeError:
+            resultados = ocr_inst.ocr(img_sin_azul)
+        palabras = _palabras_desde_paddleocr(resultados)
+        return _extraer_campos_dni(palabras, mrz, numero_pillow)
+    except Exception:
+        return _campos_vacios()
+
 
 def _consultar_reniec(numero_dni: str) -> dict | None:
     try:
@@ -736,12 +1009,6 @@ def _consultar_reniec(numero_dni: str) -> dict | None:
 
 
 def _aplicar_reniec(campos: dict, reniec: dict) -> None:
-    """
-    RENIEC es la fuente mas confiable para datos personales.
-    Siempre sobreescribe apellidos y nombres con datos de RENIEC cuando estan
-    disponibles — el OCR puede equivocarse, RENIEC no.
-    Solo el codigo verificador se aplica como fallback (si OCR no lo detecto).
-    """
     if reniec.get('apellidoPaterno'):
         campos['apellido_paterno'] = reniec['apellidoPaterno']
     if reniec.get('apellidoMaterno'):
@@ -752,99 +1019,72 @@ def _aplicar_reniec(campos: dict, reniec: dict) -> None:
         campos['codigo_verificador'] = str(reniec['digitoVerificador'])
 
 
-# ── Procesador DNI ─────────────────────────────────────────────────────────
-
 def _procesar_dni(imagen_bytes: bytes) -> dict:
-    # 1. Cargar, corregir orientacion (solo con alta confianza) y perspectiva
     img_color = _bytes_a_bgr(imagen_bytes)
     try:
         img_color = _rotar_si_necesario(img_color)
         img_color = _corregir_perspectiva(img_color)
     except Exception:
-        img_color = _bytes_a_bgr(imagen_bytes)  # si algo sale mal, recargar original
+        img_color = _bytes_a_bgr(imagen_bytes)
     img_color = _escalar(img_color)
 
-    # 2. Binarizar para OCR espacial
-    img_bin = _preprocesar_zona(img_color)
-    img_bin = _deskew(img_bin)
+    # Franja azul eliminada antes del OCR espacial
+    img_sin_azul = _eliminar_franja_azul(img_color)
 
-    # 3. OCR espacial (bounding boxes) — fuente principal de campos de texto
-    datos_ocr = _obtener_datos_ocr(img_bin)
-    palabras = _construir_palabras(datos_ocr)
-    texto_espacial = _texto_completo(palabras)
+    # Número DNI vía Pillow (compartido entre los 3 motores — más fiable)
+    numero_pillow = _extraer_numero_multi_variante(imagen_bytes)
 
-    # 4. MRZ — zona especifica optimizada para lectura de la franja inferior
-    img_mrz_n, img_mrz_i = _zona_mrz(img_color)
-    texto_mrz = _ocr_mrz_zona(img_mrz_n, img_mrz_i)
+    # Texto Pillow para MRZ y texto_raw
     texto_pillow = _texto_pillow_variante(imagen_bytes, 2.0, 1.0)
-    if _score_mrz(texto_mrz) < 10:
-        texto_mrz = _mrz_desde_texto_general(texto_pillow) or texto_mrz
-    mrz = _parsear_mrz(texto_mrz)
 
-    # 5. Numero DNI: Pillow keyword-first (multi-variante) → espacial → MRZ
-    img_zona_num = _zona_numero_dni(img_color)
-    numero_dni = _extraer_numero_multi_variante(imagen_bytes)
-    if not numero_dni:
-        numero_dni = _extraer_numero_dni_spatial(texto_espacial, palabras, img_zona_num)
-    if not numero_dni and mrz:
-        numero_dni = mrz.get('numero_dni_mrz')
+    # MRZ compartido (fastmrz ONNX primero, luego parser propio)
+    mrz = _parsear_mrz_fastmrz(imagen_bytes)
+    if not mrz:
+        img_mrz_n, img_mrz_i = _zona_mrz(img_color)
+        texto_mrz = _ocr_mrz_zona(img_mrz_n, img_mrz_i)
+        if _score_mrz(texto_mrz) < 10:
+            texto_mrz = _mrz_desde_texto_general(texto_pillow) or texto_mrz
+        mrz = _parsear_mrz(texto_mrz)
 
-    # 6. Apellidos y nombres: espacial primero → MRZ solo si valor es valido y OCR fallo
-    apellido_paterno, apellido_materno = _extraer_apellidos(texto_espacial, palabras)
-    nombres = _extraer_nombres(texto_espacial, palabras)
+    # Motor 1 — Tesseract
+    img_bin = _preprocesar_zona(img_sin_azul)
+    img_bin = _deskew(img_bin)
+    datos_ocr = _obtener_datos_ocr(img_bin)
+    palabras_tess = _construir_palabras(datos_ocr)
 
-    if mrz:
-        ap_mrz = mrz.get('apellido_paterno_mrz')
-        am_mrz = mrz.get('apellido_materno_mrz')
-        n_mrz  = mrz.get('nombres_mrz')
-        if not apellido_paterno and _nombre_mrz_valido(ap_mrz):
-            apellido_paterno = ap_mrz
-        if not apellido_materno and _nombre_mrz_valido(am_mrz):
-            apellido_materno = am_mrz
-        if not nombres and _nombre_mrz_valido(n_mrz):
-            nombres = n_mrz
+    # Si Pillow no encontró el número, intentar con zona recortada
+    if not numero_pillow:
+        img_zona_num = _zona_numero_dni(img_color)
+        texto_esp = _texto_completo(palabras_tess)
+        numero_pillow = _extraer_numero_dni_spatial(texto_esp, palabras_tess, img_zona_num)
+        if not numero_pillow and mrz:
+            numero_pillow = mrz.get('numero_dni_mrz')
 
-    # 7. Fechas y otros campos: espacial → MRZ como fallback
-    fecha_nac = _extraer_fecha_nacimiento(texto_espacial, palabras)
-    sexo      = _extraer_sexo(texto_espacial, palabras)
-    fecha_cad = _extraer_fecha_caducidad(texto_espacial, palabras)
+    campos_tess   = _extraer_campos_dni(palabras_tess, mrz, numero_pillow)
 
-    if mrz:
-        if not fecha_nac:
-            fecha_nac = mrz.get('fecha_nacimiento_mrz')
-        if not sexo:
-            sexo = mrz.get('sexo_mrz')
-        if not fecha_cad:
-            fecha_cad = mrz.get('fecha_caducidad_mrz')
+    # Motor 2 — EasyOCR (opcional, pip install easyocr)
+    campos_easy   = _campos_engine_easyocr(img_sin_azul, mrz, numero_pillow)
 
-    campos = {
-        'numero_dni':         numero_dni,
-        'codigo_verificador': _extraer_codigo_verificador(texto_espacial, palabras),
-        'apellido_paterno':   apellido_paterno,
-        'apellido_materno':   apellido_materno,
-        'nombres':            nombres,
-        'fecha_nacimiento':   fecha_nac,
-        'sexo':               sexo,
-        'estado_civil':       _extraer_estado_civil(texto_espacial, palabras),
-        'ubigeo':             _extraer_ubigeo(texto_espacial, palabras),
-        'fecha_emision':      _extraer_fecha_emision(texto_espacial, palabras),
-        'fecha_caducidad':    fecha_cad,
-    }
+    # Motor 3 — PaddleOCR (opcional, pip install paddleocr paddlepaddle)
+    campos_paddle = _campos_engine_paddleocr(img_sin_azul, mrz, numero_pillow)
 
-    # 8. Consultar RENIEC — se devuelve separado, el frontend muestra ambas fuentes
+    # RENIEC: usa el primer número válido que encuentre algún motor
+    numero_final = (campos_tess.get('numero_dni')
+                    or campos_easy.get('numero_dni')
+                    or campos_paddle.get('numero_dni'))
     reniec_data = None
-    if numero_dni and len(numero_dni) == 8 and numero_dni.isdigit():
-        reniec_data = _consultar_reniec(numero_dni)
+    if numero_final and len(numero_final) == 8 and numero_final.isdigit():
+        reniec_data = _consultar_reniec(numero_final)
 
     return {
         'tipo_documento': 'DNI',
-        'campos': campos,       # solo OCR — valores crudos de la imagen
-        'reniec': reniec_data,  # respuesta raw de RENIEC para mostrar en columna separada
-        'texto_raw': texto_pillow,
+        'tesseract':  campos_tess,
+        'easyocr':    campos_easy,
+        'paddleocr':  campos_paddle,
+        'reniec':     reniec_data,
+        'texto_raw':  texto_pillow,
     }
 
-
-# ── Procesador Carnet de Extranjeria ───────────────────────────────────────
 
 def _procesar_carnet(imagen_bytes: bytes) -> dict:
     img = Image.open(io.BytesIO(imagen_bytes)).convert('L')
@@ -911,13 +1151,10 @@ def _procesar_carnet(imagen_bytes: bytes) -> dict:
     }
 
 
-# ── API publica ────────────────────────────────────────────────────────────
-
 def detectar(imagen_bytes: bytes, tipo_documento: str) -> dict:
     if not OCR_DISPONIBLE:
         raise RuntimeError(
-            'Faltan dependencias: pip install pytesseract Pillow opencv-python requests. '
-            'Tambien instala Tesseract: https://github.com/UB-Mannheim/tesseract/wiki'
+            'Faltan dependencias'
         )
     try:
         if tipo_documento == 'DNI':
