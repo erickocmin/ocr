@@ -22,13 +22,14 @@ _RENIEC_URL = 'https://api.apis.net.pe/v2/reniec/dni'
 _ETIQUETAS_DNI = {
     "PRIMER", "SEGUNDO", "APELLIDO", "APELLIDOS", "NOMBRES", "NOMBRE",
     "SEXO", "CIVIL", "UBIGEO", "NACIMIENTO", "EMISION", "CADUCIDAD",
-    "FECHA", "ESTADO", "LUGAR", "DNI", "PERU", "PER",
+    "FECHA", "ESTADO", "LUGAR", "DNI", "PERU", "PER", "PRE",
+    "INSCRIPCION", "INSCRIPCIÓN", "IDENTIDAD", "NACIONAL", "REGISTRO",
 }
 
 _DIGIT_A_LETRA = str.maketrans("015348672", "OISAEBGZA")
 
 
-# ── Carga de imagen ────────────────────────────────────────────────────────
+# ── Carga y preprocesamiento de imagen ────────────────────────────────────
 
 def _bytes_a_bgr(imagen_bytes: bytes):
     arr = np.frombuffer(imagen_bytes, np.uint8)
@@ -38,13 +39,86 @@ def _bytes_a_bgr(imagen_bytes: bytes):
     return img
 
 
-# ── Preprocesamiento ───────────────────────────────────────────────────────
+def _rotar_si_necesario(img_bgr):
+    """
+    Auto-rotación solo si Tesseract OSD tiene alta confianza (>=4.0).
+    Evita rotar imágenes ya correctamente orientadas.
+    """
+    try:
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        osd = pytesseract.image_to_osd(gray, output_type=pytesseract.Output.DICT)
+        angulo = osd.get('rotate', 0)
+        confianza = float(osd.get('orientation_conf', 0))
+        if confianza >= 4.0 and angulo in (90, 180, 270):
+            if angulo == 90:
+                return cv2.rotate(img_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            if angulo == 180:
+                return cv2.rotate(img_bgr, cv2.ROTATE_180)
+            if angulo == 270:
+                return cv2.rotate(img_bgr, cv2.ROTATE_90_CLOCKWISE)
+    except Exception:
+        pass
+    return img_bgr
+
+
+def _corregir_perspectiva(img_bgr):
+    """
+    Corrección de perspectiva usando detección del contorno de la tarjeta.
+    Solo se aplica cuando el contorno detectado cubre >=35% del área y tiene
+    ratio de aspecto plausible para un DNI (1.3-2.0).
+    """
+    h, w = img_bgr.shape[:2]
+    area_total = h * w
+
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blurred, 50, 150)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    edges = cv2.dilate(edges, kernel, iterations=1)
+
+    contornos, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contornos:
+        return img_bgr
+
+    contornos = sorted(contornos, key=cv2.contourArea, reverse=True)
+    for cnt in contornos[:5]:
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+        area_cnt = cv2.contourArea(approx)
+        if len(approx) != 4:
+            continue
+        if area_cnt < area_total * 0.35:
+            continue
+        pts = approx.reshape(4, 2).astype(np.float32)
+        s = pts.sum(axis=1)
+        diff = np.diff(pts, axis=1)
+        rect = np.array([
+            pts[np.argmin(s)],
+            pts[np.argmin(diff)],
+            pts[np.argmax(s)],
+            pts[np.argmax(diff)],
+        ], dtype=np.float32)
+        ancho = max(int(np.linalg.norm(rect[1] - rect[0])),
+                    int(np.linalg.norm(rect[2] - rect[3])))
+        alto  = max(int(np.linalg.norm(rect[3] - rect[0])),
+                    int(np.linalg.norm(rect[2] - rect[1])))
+        ratio = ancho / alto if alto > 0 else 0
+        if 1.3 < ratio < 2.0 and ancho > 50 and alto > 50:
+            dst = np.array([[0, 0], [ancho - 1, 0],
+                            [ancho - 1, alto - 1], [0, alto - 1]], dtype=np.float32)
+            M = cv2.getPerspectiveTransform(rect, dst)
+            resultado = cv2.warpPerspective(img_bgr, M, (ancho, alto))
+            if resultado is not None and resultado.size > 0:
+                return resultado
+        break
+    return img_bgr
+
 
 def _escalar(img, min_ancho=1800):
     h, w = img.shape[:2]
     if w < min_ancho:
         factor = min_ancho / w
-        img = cv2.resize(img, None, fx=factor, fy=factor, interpolation=cv2.INTER_CUBIC)
+        img = cv2.resize(img, None, fx=factor, fy=factor, interpolation=cv2.INTER_LANCZOS4)
     return img
 
 
@@ -58,13 +132,11 @@ def _deskew(img):
         return img
     h, w = img.shape
     M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
-    return cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    return cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC,
+                          borderMode=cv2.BORDER_REPLICATE)
 
 
-def _preprocesar_zona(img_bgr, escala_extra=1.0):
-    if escala_extra > 1.0:
-        img_bgr = cv2.resize(img_bgr, None, fx=escala_extra, fy=escala_extra,
-                             interpolation=cv2.INTER_CUBIC)
+def _preprocesar_zona(img_bgr):
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     gray = cv2.fastNlMeansDenoising(gray, h=12)
     clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
@@ -77,7 +149,22 @@ def _preprocesar_zona(img_bgr, escala_extra=1.0):
     return cv2.bitwise_or(otsu, adapt)
 
 
-# ── Zonas de interés del DNI ───────────────────────────────────────────────
+# ── Preprocesamiento Pillow (original — confiable para número DNI) ────────
+
+def _texto_pillow_variante(imagen_bytes: bytes, contrast: float = 2.0,
+                           brightness: float = 1.0) -> str:
+    img = Image.open(io.BytesIO(imagen_bytes)).convert('L')
+    if brightness != 1.0:
+        img = ImageEnhance.Brightness(img).enhance(brightness)
+    img = ImageEnhance.Contrast(img).enhance(contrast)
+    img = img.filter(ImageFilter.MedianFilter(size=3))
+    w, h = img.size
+    if w < 800:
+        img = img.resize((int(w * 800 / w), int(h * 800 / w)), Image.LANCZOS)
+    return pytesseract.image_to_string(img, config='--oem 3 --psm 6 -l spa+eng')
+
+
+# ── Zonas de interés ───────────────────────────────────────────────────────
 
 def _recortar(img_bgr, x1r, y1r, x2r, y2r):
     h, w = img_bgr.shape[:2]
@@ -85,14 +172,18 @@ def _recortar(img_bgr, x1r, y1r, x2r, y2r):
 
 
 def _zona_numero_dni(img_bgr):
-    recorte = _recortar(img_bgr, 0.52, 0.04, 1.00, 0.32)
-    return _preprocesar_zona(recorte, escala_extra=2.5)
+    """Recorta la zona del encabezado donde aparece 'DNI XXXXXXXX-X'."""
+    recorte = _recortar(img_bgr, 0.45, 0.00, 1.00, 0.28)
+    gray = cv2.cvtColor(recorte, cv2.COLOR_BGR2GRAY)
+    gray = cv2.resize(gray, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_LANCZOS4)
+    _, b = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return b
 
 
 def _zona_mrz(img_bgr):
-    recorte = _recortar(img_bgr, 0.00, 0.72, 1.00, 1.00)
+    recorte = _recortar(img_bgr, 0.00, 0.70, 1.00, 1.00)
     gray = cv2.cvtColor(recorte, cv2.COLOR_BGR2GRAY)
-    gray = cv2.resize(gray, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.resize(gray, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_LANCZOS4)
     gray = cv2.fastNlMeansDenoising(gray, h=20)
     clahe = cv2.createCLAHE(clipLimit=3.5, tileGridSize=(8, 8))
     gray = clahe.apply(gray)
@@ -102,25 +193,22 @@ def _zona_mrz(img_bgr):
 
 # ── OCR con bounding boxes ─────────────────────────────────────────────────
 
-def _score_datos(datos):
-    confs = [float(c) for c in datos["conf"] if str(c).lstrip("-").isdigit()]
-    return sum(c for c in confs if c >= 50) / (len(confs) + 1) if confs else 0
-
-
 def _obtener_datos_ocr(img):
     mejor_datos, mejor_score = None, -1
     for psm in ("6", "4", "3"):
-        for lang in ("spa", "eng"):
+        for lang in ("spa+eng", "spa", "eng"):
             try:
                 datos = pytesseract.image_to_data(
                     img, output_type=Output.DICT,
                     config=f"--oem 3 --psm {psm} -l {lang}"
                 )
-                score = _score_datos(datos)
+                confs = [float(c) for c in datos["conf"] if str(c).lstrip("-").isdigit()]
+                score = sum(c for c in confs if c >= 50) / (len(confs) + 1) if confs else 0
                 if score > mejor_score:
                     mejor_score, mejor_datos = score, datos
+                break  # si este lang funciono, no probar el siguiente
             except Exception:
-                pass
+                continue
     if mejor_datos is None:
         raise RuntimeError("No fue posible ejecutar OCR.")
     return mejor_datos
@@ -197,7 +285,7 @@ def _ocr_mrz_zona(img_normal, img_invertida):
     mejor_texto, mejor_score = "", -1
     wl = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<"
     for img in (img_normal, img_invertida):
-        for psm in ("6", "4", "11"):
+        for psm in ("6", "4", "11", "7"):
             try:
                 t = pytesseract.image_to_string(
                     img,
@@ -257,6 +345,15 @@ def _es_etiqueta_dni(texto):
     return all(p in _ETIQUETAS_DNI for p in texto.upper().split())
 
 
+def _nombre_mrz_valido(texto) -> bool:
+    """Verifica que un valor del MRZ sea un nombre plausible (sin dígitos ni ruido)."""
+    if not texto or len(texto) < 2:
+        return False
+    if re.search(r'\d', texto):
+        return False
+    return bool(re.search(r'[A-ZÁÉÍÓÚÜÑ]', texto))
+
+
 def _parsear_mrz(texto_mrz):
     if not texto_mrz:
         return None
@@ -284,26 +381,30 @@ def _parsear_mrz(texto_mrz):
         resultado["sexo_mrz"] = s if s in ("M", "F") else None
         resultado["fecha_caducidad_mrz"] = _mrz_fecha(linea2[8:14])
 
+    # Línea 3: APELLIDO(S)<<NOMBRE1<NOMBRE2 — separador << entre apellidos y nombres
     linea3 = next(
-        (l for l in lineas if "<" in l and l != linea2
+        (l for l in lineas if "<<" in l and l != linea2
          and not re.match(r"\d{6}\d[MF<]", l)),
         None
     )
     if linea3:
-        segmentos = [_corregir_nombre(s) for s in re.split(r"<+", linea3) if s]
-        segmentos = [s for s in segmentos if s and not _es_etiqueta_dni(s)]
-        if len(segmentos) >= 3:
-            resultado["apellido_paterno_mrz"] = segmentos[0]
-            resultado["apellido_materno_mrz"] = segmentos[1]
-            resultado["nombres_mrz"] = " ".join(segmentos[2:])
-        elif len(segmentos) == 2:
-            resultado["apellido_paterno_mrz"] = segmentos[0]
+        partes = linea3.split("<<", 1)
+        apellidos_part = partes[0]
+        nombres_part = partes[1] if len(partes) > 1 else ""
+
+        apellidos_segs = [_corregir_nombre(s) for s in apellidos_part.split("<") if s]
+        apellidos_segs = [s for s in apellidos_segs if s and not _es_etiqueta_dni(s)]
+        if len(apellidos_segs) >= 2:
+            resultado["apellido_paterno_mrz"] = apellidos_segs[0]
+            resultado["apellido_materno_mrz"] = apellidos_segs[1]
+        elif len(apellidos_segs) == 1:
+            resultado["apellido_paterno_mrz"] = apellidos_segs[0]
             resultado["apellido_materno_mrz"] = None
-            resultado["nombres_mrz"] = segmentos[1]
-        elif len(segmentos) == 1:
-            resultado["apellido_paterno_mrz"] = segmentos[0]
-            resultado["apellido_materno_mrz"] = None
-            resultado["nombres_mrz"] = None
+
+        nombres_segs = [_corregir_nombre(s) for s in nombres_part.split("<") if s]
+        nombres_segs = [s for s in nombres_segs if s and not _es_etiqueta_dni(s)]
+        if nombres_segs:
+            resultado["nombres_mrz"] = " ".join(nombres_segs)
 
     return resultado if resultado else None
 
@@ -326,7 +427,7 @@ def _buscar_valor_derecha(palabras, etiquetas, dist_max=700, tol_y=22):
     return None
 
 
-def _buscar_valor_abajo(palabras, etiquetas, dist_max=80, tol_x=300):
+def _buscar_valor_abajo(palabras, etiquetas, dist_max=90, tol_x=350):
     etiquetas_up = [e.upper() for e in etiquetas]
     for p in palabras:
         if any(e in p["texto"].upper() for e in etiquetas_up):
@@ -338,7 +439,9 @@ def _buscar_valor_abajo(palabras, etiquetas, dist_max=80, tol_x=300):
                 key=lambda x: x["y"]
             )
             if candidatos:
-                return " ".join(c["texto"] for c in candidatos)
+                texto_val = " ".join(c["texto"] for c in candidatos)
+                if not _es_etiqueta_dni(texto_val):
+                    return texto_val
     return None
 
 
@@ -357,18 +460,46 @@ def _limpiar_ocr_num(txt):
 
 
 def _extraer_numero_simple(lineas: list) -> str | None:
-    """Regex directo sobre cada línea — fue el que detectó correctamente el DNI."""
+    """
+    Extrae el número DNI de 8 dígitos del texto OCR.
+    Prioridad:
+    1. Patron "DNI XXXXXXXX-X" del encabezado (mas especifico)
+    2. Patron "DNI XXXXXXXX" sin digito verificador
+    3. Primer numero de 8 digitos que no sea fecha (fallback generico)
+    """
+    texto = '\n'.join(lineas)
+
+    m = re.search(r'\bDNI\s+(\d{8})\s*[-–]\s*\d', texto, re.IGNORECASE)
+    if m and not _parece_fecha(m.group(1)):
+        return m.group(1)
+
+    m = re.search(r'\bDNI\s+(\d{8})\b', texto, re.IGNORECASE)
+    if m and not _parece_fecha(m.group(1)):
+        return m.group(1)
+
     for linea in lineas:
         m = re.search(r'\b(\d{8})\b', linea)
-        if m:
-            candidato = m.group(1)
-            if not _parece_fecha(candidato):
-                return candidato
+        if m and not _parece_fecha(m.group(1)):
+            return m.group(1)
+
+    return None
+
+
+def _extraer_numero_multi_variante(imagen_bytes: bytes) -> str | None:
+    """Prueba multiples variantes de contraste/brillo para encontrar el numero DNI."""
+    for contrast, brightness in [(2.0, 1.0), (1.5, 1.2), (3.0, 0.9), (1.0, 1.0)]:
+        try:
+            texto = _texto_pillow_variante(imagen_bytes, contrast, brightness)
+            lineas = [l.strip() for l in texto.splitlines() if l.strip()]
+            resultado = _extraer_numero_simple(lineas)
+            if resultado:
+                return resultado
+        except Exception:
+            continue
     return None
 
 
 def _extraer_numero_dni_spatial(texto, palabras, zona_num_img=None):
-    """Enfoque espacial como segundo intento."""
     def _validar(s):
         s = _limpiar_ocr_num(re.sub(r"\D", "", s))
         return s[:8] if len(s) >= 8 and not _parece_fecha(s[:8]) else None
@@ -403,14 +534,6 @@ def _extraer_numero_dni_spatial(texto, palabras, zona_num_img=None):
                 v = _validar("".join(c["texto"] for c in candidatos))
                 if v:
                     return v
-
-    for patron in [r"\bDNI\s*[:\-Nº°]?\s*([\d][\d\s]{5,10}[\d])",
-                   r"(?<!\d)([\d][\d\s]{5,10}[\d])(?!\d)"]:
-        for m in re.finditer(patron, texto, re.IGNORECASE):
-            v = _validar(m.group(1))
-            if v:
-                return v
-
     return None
 
 
@@ -432,7 +555,7 @@ def _extraer_codigo_verificador(texto, palabras):
     return None
 
 
-# ── Extracción de otros campos DNI ─────────────────────────────────────────
+# ── Extraccion de campos DNI ───────────────────────────────────────────────
 
 def _extraer_apellidos(texto, palabras):
     paterno, materno = None, None
@@ -464,11 +587,11 @@ def _extraer_apellidos(texto, palabras):
                     materno = partes[1] if len(partes) > 1 else None
 
     if not paterno:
-        m = re.search(r"PRIMER\s+APELLIDO\s*[:\-]?\s*([A-ZÁÉÍÓÚÜÑ0-9 ]+)", texto, re.I)
+        m = re.search(r"PRIMER\s+APELLIDO\s*[:\-]?\s*([A-ZÁÉÍÓÚÜÑA-Z ]+)", texto, re.I)
         if m:
             paterno = _corregir_nombre(m.group(1))
     if not materno:
-        m = re.search(r"SEGUNDO\s+APELLIDO\s*[:\-]?\s*([A-ZÁÉÍÓÚÜÑ0-9 ]+)", texto, re.I)
+        m = re.search(r"SEGUNDO\s+APELLIDO\s*[:\-]?\s*([A-ZÁÉÍÓÚÜÑA-Z ]+)", texto, re.I)
         if m:
             materno = _corregir_nombre(m.group(1))
 
@@ -486,49 +609,65 @@ def _extraer_nombres(texto, palabras):
         v = _corregir_nombre(v)
         if v and not _es_etiqueta_dni(v):
             return v
-    m = re.search(r"NOMBRES?\s*[:\-]?\s*([A-ZÁÉÍÓÚÜÑ0-9 ]+)", texto, re.IGNORECASE)
+    m = re.search(r"NOMBRES?\s*[:\-]?\s*([A-ZÁÉÍÓÚÜÑA-Z ]+)", texto, re.IGNORECASE)
     return _corregir_nombre(m.group(1)) if m else None
 
 
-def _normalizar_fecha(txt):
-    return re.sub(r"[.\-]", "/", txt.strip()) if txt else None
+_RE_FECHA = re.compile(r'(\d{2})[\s\/\-\.](\d{2})[\s\/\-\.](\d{4})')
+
+
+def _normalizar_fecha(txt) -> str | None:
+    if not txt:
+        return None
+    m = _RE_FECHA.search(str(txt))
+    if m:
+        return f"{m.group(1)}/{m.group(2)}/{m.group(3)}"
+    return None
 
 
 def _extraer_fecha_nacimiento(texto, palabras):
-    v = _buscar_valor_derecha(palabras, ["NACIMIENTO", "F.NAC"])
-    if v:
-        m = re.search(r"\d{2}[\/\-\.]\d{2}[\/\-\.]\d{4}", v)
-        if m:
-            return _normalizar_fecha(m.group())
+    for fn, kw in [
+        (_buscar_valor_derecha, {"dist_max": 700, "tol_y": 22}),
+        (_buscar_valor_abajo,   {"dist_max": 100, "tol_x": 350}),
+    ]:
+        v = fn(palabras, ["NACIMIENTO", "F.NAC"], **kw)
+        if v and _normalizar_fecha(v):
+            return _normalizar_fecha(v)
     m = re.search(
-        r"(?:FECHA\s+DE\s+NACIMIENTO|NACIMIENTO)\s*[:\-]?\s*(\d{2}[\/\-\.]\d{2}[\/\-\.]\d{4})",
+        r"(?:FECHA\s+DE\s+NACIMIENTO|NACIMIENTO)\s*[:\-]?\s*"
+        r"(\d{2}[\s\/\-\.]\d{2}[\s\/\-\.]\d{4})",
         texto, re.IGNORECASE
     )
     return _normalizar_fecha(m.group(1)) if m else None
 
 
 def _extraer_fecha_emision(texto, palabras):
-    v = _buscar_valor_derecha(palabras, ["EMISION", "EMISIÓN", "F.EMIS"])
-    if v:
-        m = re.search(r"\d{2}[\/\-\.]\d{2}[\/\-\.]\d{4}", v)
-        if m:
-            return _normalizar_fecha(m.group())
+    for fn, kw in [
+        (_buscar_valor_derecha, {"dist_max": 700, "tol_y": 22}),
+        (_buscar_valor_abajo,   {"dist_max": 120, "tol_x": 400}),
+    ]:
+        v = fn(palabras, ["EMISION", "EMISIÓN", "EMISI"], **kw)
+        if v and _normalizar_fecha(v):
+            return _normalizar_fecha(v)
     m = re.search(
-        r"(?:FECHA\s+DE\s+EMISI[OÓ]N|EMISI[OÓ]N)\s*[:\-]?\s*(\d{2}[\/\-\.]\d{2}[\/\-\.]\d{4})",
+        r"(?:FECHA\s+DE\s+EMISI[OÓ]N|EMISI[OÓ]N)\s*[:\-]?\s*"
+        r"(\d{2}[\s\/\-\.]\d{2}[\s\/\-\.]\d{4})",
         texto, re.IGNORECASE
     )
     return _normalizar_fecha(m.group(1)) if m else None
 
 
 def _extraer_fecha_caducidad(texto, palabras):
-    v = _buscar_valor_derecha(palabras, ["VENCIMIENTO", "CADUCIDAD", "VENC", "CADUC"])
-    if v:
-        m = re.search(r"\d{2}[\/\-\.]\d{2}[\/\-\.]\d{4}", v)
-        if m:
-            return _normalizar_fecha(m.group())
+    for fn, kw in [
+        (_buscar_valor_derecha, {"dist_max": 700, "tol_y": 22}),
+        (_buscar_valor_abajo,   {"dist_max": 120, "tol_x": 400}),
+    ]:
+        v = fn(palabras, ["VENCIMIENTO", "CADUCIDAD", "VENC", "CADUC"], **kw)
+        if v and _normalizar_fecha(v):
+            return _normalizar_fecha(v)
     m = re.search(
         r"(?:FECHA\s+DE\s+(?:VENCIMIENTO|CADUCIDAD)|VENCIMIENTO|CADUCIDAD)\s*[:\-]?\s*"
-        r"(\d{2}[\/\-\.]\d{2}[\/\-\.]\d{4})",
+        r"(\d{2}[\s\/\-\.]\d{2}[\s\/\-\.]\d{4})",
         texto, re.IGNORECASE
     )
     return _normalizar_fecha(m.group(1)) if m else None
@@ -548,21 +687,37 @@ def _extraer_sexo(texto, palabras):
 
 
 def _extraer_estado_civil(texto, palabras):
-    v = _buscar_valor_derecha(palabras, ["EST.CIVIL", "ESTADO CIVIL", "EST CIVIL"])
-    if v:
-        return _corregir_nombre(v.strip())
+    for etiquetas in [["EST.CIVIL", "ESTADO CIVIL"], ["CIVIL"]]:
+        v = _buscar_valor_derecha(palabras, etiquetas)
+        if v:
+            corrected = _corregir_nombre(v.strip())
+            if corrected and not _es_etiqueta_dni(corrected):
+                return corrected
     m = re.search(r"(?:EST\.?\s*CIVIL|ESTADO\s+CIVIL)\s*[:\-]?\s*(\w+)", texto, re.IGNORECASE)
     return _corregir_nombre(m.group(1)) if m else None
 
 
 def _extraer_ubigeo(texto, palabras):
-    v = _buscar_valor_derecha(palabras, ["UBIGEO", "UBIG"])
-    if v:
-        m = re.search(r"\d{6}", v)
-        if m:
-            return m.group()
+    for fn, kw in [
+        (_buscar_valor_derecha, {"dist_max": 700, "tol_y": 22}),
+        (_buscar_valor_abajo,   {"dist_max": 120, "tol_x": 400}),
+    ]:
+        v = fn(palabras, ["UBIGEO", "UBIG"], **kw)
+        if v:
+            m = re.search(r"\d{6}", v)
+            if m:
+                return m.group()
+
     m = re.search(r"\bUBIGEO\s*[:\-]?\s*(\d{6})\b", texto, re.IGNORECASE)
-    return m.group(1) if m else None
+    if m:
+        return m.group(1)
+
+    # Patron: fecha de nacimiento seguida del ubigeo en la misma linea
+    m = re.search(r"\d{2}[\s\/\-\.]\d{2}[\s\/\-\.]\d{4}\s{1,10}(\d{6})\b", texto)
+    if m:
+        return m.group(1)
+
+    return None
 
 
 # ── RENIEC ─────────────────────────────────────────────────────────────────
@@ -580,17 +735,19 @@ def _consultar_reniec(numero_dni: str) -> dict | None:
         return None
 
 
-def _completar_desde_reniec(campos: dict, reniec: dict) -> None:
-    """Rellena con datos de RENIEC los campos que el OCR no detectó."""
-    mapa = {
-        'apellido_paterno': 'apellidoPaterno',
-        'apellido_materno': 'apellidoMaterno',
-        'nombres': 'nombres',
-    }
-    for campo_local, campo_reniec in mapa.items():
-        if not campos[campo_local] and reniec.get(campo_reniec):
-            campos[campo_local] = reniec[campo_reniec]
-
+def _aplicar_reniec(campos: dict, reniec: dict) -> None:
+    """
+    RENIEC es la fuente mas confiable para datos personales.
+    Siempre sobreescribe apellidos y nombres con datos de RENIEC cuando estan
+    disponibles — el OCR puede equivocarse, RENIEC no.
+    Solo el codigo verificador se aplica como fallback (si OCR no lo detecto).
+    """
+    if reniec.get('apellidoPaterno'):
+        campos['apellido_paterno'] = reniec['apellidoPaterno']
+    if reniec.get('apellidoMaterno'):
+        campos['apellido_materno'] = reniec['apellidoMaterno']
+    if reniec.get('nombres'):
+        campos['nombres'] = reniec['nombres']
     if not campos.get('codigo_verificador') and reniec.get('digitoVerificador') is not None:
         campos['codigo_verificador'] = str(reniec['digitoVerificador'])
 
@@ -598,90 +755,96 @@ def _completar_desde_reniec(campos: dict, reniec: dict) -> None:
 # ── Procesador DNI ─────────────────────────────────────────────────────────
 
 def _procesar_dni(imagen_bytes: bytes) -> dict:
+    # 1. Cargar, corregir orientacion (solo con alta confianza) y perspectiva
     img_color = _bytes_a_bgr(imagen_bytes)
+    try:
+        img_color = _rotar_si_necesario(img_color)
+        img_color = _corregir_perspectiva(img_color)
+    except Exception:
+        img_color = _bytes_a_bgr(imagen_bytes)  # si algo sale mal, recargar original
     img_color = _escalar(img_color)
+
+    # 2. Binarizar para OCR espacial
     img_bin = _preprocesar_zona(img_color)
     img_bin = _deskew(img_bin)
 
-    # OCR con bounding boxes (para extracción espacial)
+    # 3. OCR espacial (bounding boxes) — fuente principal de campos de texto
     datos_ocr = _obtener_datos_ocr(img_bin)
     palabras = _construir_palabras(datos_ocr)
     texto_espacial = _texto_completo(palabras)
 
-    # OCR simple (para regex de 8 dígitos que funcionó)
-    texto_simple = pytesseract.image_to_string(img_bin, config='--oem 3 --psm 6 -l spa+eng')
-    lineas_simples = [l.strip() for l in texto_simple.splitlines() if l.strip()]
-
-    # Zonas especializadas
-    img_zona_num = _zona_numero_dni(img_color)
+    # 4. MRZ — zona especifica optimizada para lectura de la franja inferior
     img_mrz_n, img_mrz_i = _zona_mrz(img_color)
-
-    # MRZ
     texto_mrz = _ocr_mrz_zona(img_mrz_n, img_mrz_i)
+    texto_pillow = _texto_pillow_variante(imagen_bytes, 2.0, 1.0)
     if _score_mrz(texto_mrz) < 10:
-        texto_mrz = _mrz_desde_texto_general(texto_simple) or texto_mrz
+        texto_mrz = _mrz_desde_texto_general(texto_pillow) or texto_mrz
     mrz = _parsear_mrz(texto_mrz)
 
-    # Número DNI: mi regex simple primero → espacial → MRZ
-    numero_dni = _extraer_numero_simple(lineas_simples)
+    # 5. Numero DNI: Pillow keyword-first (multi-variante) → espacial → MRZ
+    img_zona_num = _zona_numero_dni(img_color)
+    numero_dni = _extraer_numero_multi_variante(imagen_bytes)
     if not numero_dni:
         numero_dni = _extraer_numero_dni_spatial(texto_espacial, palabras, img_zona_num)
     if not numero_dni and mrz:
         numero_dni = mrz.get('numero_dni_mrz')
 
-    # Demás campos: enfoque espacial + MRZ como fallback
+    # 6. Apellidos y nombres: espacial primero → MRZ solo si valor es valido y OCR fallo
     apellido_paterno, apellido_materno = _extraer_apellidos(texto_espacial, palabras)
-    if not apellido_paterno and mrz:
-        apellido_paterno = mrz.get('apellido_paterno_mrz')
-    if not apellido_materno and mrz:
-        apellido_materno = mrz.get('apellido_materno_mrz')
-
     nombres = _extraer_nombres(texto_espacial, palabras)
-    if not nombres and mrz:
-        nombres = mrz.get('nombres_mrz')
 
+    if mrz:
+        ap_mrz = mrz.get('apellido_paterno_mrz')
+        am_mrz = mrz.get('apellido_materno_mrz')
+        n_mrz  = mrz.get('nombres_mrz')
+        if not apellido_paterno and _nombre_mrz_valido(ap_mrz):
+            apellido_paterno = ap_mrz
+        if not apellido_materno and _nombre_mrz_valido(am_mrz):
+            apellido_materno = am_mrz
+        if not nombres and _nombre_mrz_valido(n_mrz):
+            nombres = n_mrz
+
+    # 7. Fechas y otros campos: espacial → MRZ como fallback
     fecha_nac = _extraer_fecha_nacimiento(texto_espacial, palabras)
-    if not fecha_nac and mrz:
-        fecha_nac = mrz.get('fecha_nacimiento_mrz')
-
-    sexo = _extraer_sexo(texto_espacial, palabras)
-    if not sexo and mrz:
-        sexo = mrz.get('sexo_mrz')
-
+    sexo      = _extraer_sexo(texto_espacial, palabras)
     fecha_cad = _extraer_fecha_caducidad(texto_espacial, palabras)
-    if not fecha_cad and mrz:
-        fecha_cad = mrz.get('fecha_caducidad_mrz')
+
+    if mrz:
+        if not fecha_nac:
+            fecha_nac = mrz.get('fecha_nacimiento_mrz')
+        if not sexo:
+            sexo = mrz.get('sexo_mrz')
+        if not fecha_cad:
+            fecha_cad = mrz.get('fecha_caducidad_mrz')
 
     campos = {
-        'numero_dni': numero_dni,
+        'numero_dni':         numero_dni,
         'codigo_verificador': _extraer_codigo_verificador(texto_espacial, palabras),
-        'apellido_paterno': apellido_paterno,
-        'apellido_materno': apellido_materno,
-        'nombres': nombres,
-        'fecha_nacimiento': fecha_nac,
-        'sexo': sexo,
-        'estado_civil': _extraer_estado_civil(texto_espacial, palabras),
-        'ubigeo': _extraer_ubigeo(texto_espacial, palabras),
-        'fecha_emision': _extraer_fecha_emision(texto_espacial, palabras),
-        'fecha_caducidad': fecha_cad,
+        'apellido_paterno':   apellido_paterno,
+        'apellido_materno':   apellido_materno,
+        'nombres':            nombres,
+        'fecha_nacimiento':   fecha_nac,
+        'sexo':               sexo,
+        'estado_civil':       _extraer_estado_civil(texto_espacial, palabras),
+        'ubigeo':             _extraer_ubigeo(texto_espacial, palabras),
+        'fecha_emision':      _extraer_fecha_emision(texto_espacial, palabras),
+        'fecha_caducidad':    fecha_cad,
     }
 
-    # Consulta RENIEC para completar campos no detectados
+    # 8. Consultar RENIEC — se devuelve separado, el frontend muestra ambas fuentes
     reniec_data = None
     if numero_dni and len(numero_dni) == 8 and numero_dni.isdigit():
         reniec_data = _consultar_reniec(numero_dni)
-        if reniec_data:
-            _completar_desde_reniec(campos, reniec_data)
 
     return {
         'tipo_documento': 'DNI',
-        'campos': campos,
-        'reniec': reniec_data,
-        'texto_raw': texto_simple,
+        'campos': campos,       # solo OCR — valores crudos de la imagen
+        'reniec': reniec_data,  # respuesta raw de RENIEC para mostrar en columna separada
+        'texto_raw': texto_pillow,
     }
 
 
-# ── Procesador Carnet de Extranjería (Pillow, más simple) ──────────────────
+# ── Procesador Carnet de Extranjeria ───────────────────────────────────────
 
 def _procesar_carnet(imagen_bytes: bytes) -> dict:
     img = Image.open(io.BytesIO(imagen_bytes)).convert('L')
@@ -689,8 +852,7 @@ def _procesar_carnet(imagen_bytes: bytes) -> dict:
     img = img.filter(ImageFilter.MedianFilter(size=3))
     w, h = img.size
     if w < 800:
-        factor = 800 / w
-        img = img.resize((int(w * factor), int(h * factor)), Image.LANCZOS)
+        img = img.resize((int(w * 800 / w), int(h * 800 / w)), Image.LANCZOS)
 
     texto = pytesseract.image_to_string(img, config='--oem 3 --psm 6 -l spa+eng')
     lineas = [l.strip() for l in texto.splitlines() if l.strip()]
@@ -703,11 +865,10 @@ def _procesar_carnet(imagen_bytes: bytes) -> dict:
             break
 
     fecha_nacimiento = None
-    patron_fecha = re.compile(r'\b(\d{2}[/\-\.]\d{2}[/\-\.]\d{4})\b')
     for linea in lineas:
-        m = patron_fecha.search(linea)
-        if m:
-            fecha_nacimiento = m.group(1)
+        f = _normalizar_fecha(linea)
+        if f:
+            fecha_nacimiento = f
             break
 
     sexo = None
@@ -738,25 +899,25 @@ def _procesar_carnet(imagen_bytes: bytes) -> dict:
     return {
         'tipo_documento': 'CARNET_EXTRANJERIA',
         'campos': {
-            'numero_carnet': numero_carnet,
-            'apellidos': apellidos,
-            'nombre': nombre,
-            'nacionalidad': nacionalidad,
+            'numero_carnet':    numero_carnet,
+            'apellidos':        apellidos,
+            'nombre':           nombre,
+            'nacionalidad':     nacionalidad,
             'fecha_nacimiento': fecha_nacimiento,
-            'sexo': sexo,
+            'sexo':             sexo,
         },
         'reniec': None,
         'texto_raw': texto,
     }
 
 
-# ── API pública ────────────────────────────────────────────────────────────
+# ── API publica ────────────────────────────────────────────────────────────
 
 def detectar(imagen_bytes: bytes, tipo_documento: str) -> dict:
     if not OCR_DISPONIBLE:
         raise RuntimeError(
             'Faltan dependencias: pip install pytesseract Pillow opencv-python requests. '
-            'También instala Tesseract: https://github.com/UB-Mannheim/tesseract/wiki'
+            'Tambien instala Tesseract: https://github.com/UB-Mannheim/tesseract/wiki'
         )
     try:
         if tipo_documento == 'DNI':
@@ -768,5 +929,5 @@ def detectar(imagen_bytes: bytes, tipo_documento: str) -> dict:
     except Exception as exc:
         raise RuntimeError(
             f'Error al procesar la imagen: {exc}. '
-            'Verifica que Tesseract esté instalado correctamente.'
+            'Verifica que Tesseract este instalado correctamente.'
         ) from exc
