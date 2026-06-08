@@ -668,7 +668,7 @@ def _extraer_apellidos(texto, palabras):
     paterno, materno = None, None
 
     for etq in ["PRIMER", "Primer"]:
-        v = _buscar_valor_abajo(palabras, [etq], dist_max=100, tol_x=350)
+        v = _buscar_valor_abajo(palabras, [etq], dist_max=220, tol_x=400)
         if v:
             v = _corregir_nombre(v)
             if v and not _es_etiqueta_dni(v) and len(v) >= 2:
@@ -676,7 +676,7 @@ def _extraer_apellidos(texto, palabras):
                 break
 
     for etq in ["SEGUNDO", "Segundo"]:
-        v = _buscar_valor_abajo(palabras, [etq], dist_max=100, tol_x=350)
+        v = _buscar_valor_abajo(palabras, [etq], dist_max=220, tol_x=400)
         if v:
             v = _corregir_nombre(v)
             if v and not _es_etiqueta_dni(v) and len(v) >= 2:
@@ -684,7 +684,7 @@ def _extraer_apellidos(texto, palabras):
                 break
 
     if not paterno:
-        v = _buscar_valor_abajo(palabras, ["APELLIDOS", "APELLIDO"], dist_max=100, tol_x=350)
+        v = _buscar_valor_abajo(palabras, ["APELLIDOS", "APELLIDO"], dist_max=220, tol_x=400)
         if v:
             v = _corregir_nombre(v)
             if v:
@@ -706,12 +706,12 @@ def _extraer_apellidos(texto, palabras):
 
 
 def _extraer_nombres(texto, palabras):
-    v = _buscar_valor_abajo(palabras, ["NOMBRES", "NOMBRE"], dist_max=100, tol_x=350)
+    v = _buscar_valor_abajo(palabras, ["NOMBRES", "NOMBRE"], dist_max=220, tol_x=400)
     if v:
         v = _corregir_nombre(v)
         if v and not _es_etiqueta_dni(v):
             return v
-    v = _buscar_valor_derecha(palabras, ["NOMBRES", "NOMBRE"], dist_max=700, tol_y=22)
+    v = _buscar_valor_derecha(palabras, ["NOMBRES", "NOMBRE"], dist_max=700, tol_y=35)
     if v:
         v = _corregir_nombre(v)
         if v and not _es_etiqueta_dni(v):
@@ -734,8 +734,8 @@ def _normalizar_fecha(txt) -> str | None:
 
 def _extraer_fecha_nacimiento(texto, palabras):
     for fn, kw in [
-        (_buscar_valor_derecha, {"dist_max": 700, "tol_y": 22}),
-        (_buscar_valor_abajo,   {"dist_max": 100, "tol_x": 350}),
+        (_buscar_valor_derecha, {"dist_max": 700, "tol_y": 35}),
+        (_buscar_valor_abajo,   {"dist_max": 220, "tol_x": 400}),
     ]:
         v = fn(palabras, ["NACIMIENTO", "F.NAC"], **kw)
         if v and _normalizar_fecha(v):
@@ -750,8 +750,8 @@ def _extraer_fecha_nacimiento(texto, palabras):
 
 def _extraer_fecha_emision(texto, palabras):
     for fn, kw in [
-        (_buscar_valor_derecha, {"dist_max": 700, "tol_y": 22}),
-        (_buscar_valor_abajo,   {"dist_max": 120, "tol_x": 400}),
+        (_buscar_valor_derecha, {"dist_max": 700, "tol_y": 35}),
+        (_buscar_valor_abajo,   {"dist_max": 220, "tol_x": 400}),
     ]:
         v = fn(palabras, ["EMISION", "EMISIÓN", "EMISI"], **kw)
         if v and _normalizar_fecha(v):
@@ -766,8 +766,8 @@ def _extraer_fecha_emision(texto, palabras):
 
 def _extraer_fecha_caducidad(texto, palabras):
     for fn, kw in [
-        (_buscar_valor_derecha, {"dist_max": 700, "tol_y": 22}),
-        (_buscar_valor_abajo,   {"dist_max": 120, "tol_x": 400}),
+        (_buscar_valor_derecha, {"dist_max": 700, "tol_y": 35}),
+        (_buscar_valor_abajo,   {"dist_max": 220, "tol_x": 400}),
     ]:
         v = fn(palabras, ["VENCIMIENTO", "CADUCIDAD", "VENC", "CADUC"], **kw)
         if v and _normalizar_fecha(v):
@@ -806,8 +806,8 @@ def _extraer_estado_civil(texto, palabras):
 
 def _extraer_ubigeo(texto, palabras):
     for fn, kw in [
-        (_buscar_valor_derecha, {"dist_max": 700, "tol_y": 22}),
-        (_buscar_valor_abajo,   {"dist_max": 120, "tol_x": 400}),
+        (_buscar_valor_derecha, {"dist_max": 700, "tol_y": 35}),
+        (_buscar_valor_abajo,   {"dist_max": 220, "tol_x": 400}),
     ]:
         v = fn(palabras, ["UBIGEO", "UBIG"], **kw)
         if v:
@@ -909,16 +909,21 @@ def _campos_vacios() -> dict:
     )}
 
 
-def _extraer_campos_dni(palabras: list, mrz: dict | None, numero_pillow: str | None) -> dict:
+def _extraer_campos_dni(palabras: list, mrz: dict | None, numero_pillow: str | None,
+                        texto_extra: str = '') -> dict:
     """Extrae todos los campos del DNI usando palabras con bounding boxes.
+    texto_extra: texto Pillow del motor Tesseract, usado como fallback para regex.
     Reutilizable para cualquier motor OCR (Tesseract, EasyOCR, PaddleOCR)."""
-    if not palabras:
+    texto = _texto_completo(palabras) if palabras else ''
+    # Combinar texto espacial + texto Pillow para dar más fuentes a los regex
+    texto_para_regex = '\n'.join(filter(None, [texto, texto_extra]))
+
+    if not palabras and not texto_para_regex:
         c = _campos_vacios()
         c['numero_dni'] = numero_pillow
         return c
 
-    texto = _texto_completo(palabras)
-    lineas = [l.strip() for l in texto.splitlines() if l.strip()]
+    lineas = [l.strip() for l in texto_para_regex.splitlines() if l.strip()]
 
     numero_dni = _extraer_numero_simple(lineas)
     if not numero_dni:
@@ -926,8 +931,8 @@ def _extraer_campos_dni(palabras: list, mrz: dict | None, numero_pillow: str | N
     if not numero_dni:
         numero_dni = numero_pillow
 
-    apellido_paterno, apellido_materno = _extraer_apellidos(texto, palabras)
-    nombres = _extraer_nombres(texto, palabras)
+    apellido_paterno, apellido_materno = _extraer_apellidos(texto_para_regex, palabras)
+    nombres = _extraer_nombres(texto_para_regex, palabras)
 
     if mrz:
         ap_mrz = mrz.get('apellido_paterno_mrz')
@@ -940,9 +945,9 @@ def _extraer_campos_dni(palabras: list, mrz: dict | None, numero_pillow: str | N
         if not nombres and _nombre_mrz_valido(n_mrz):
             nombres = n_mrz
 
-    fecha_nac = _extraer_fecha_nacimiento(texto, palabras)
-    sexo      = _extraer_sexo(texto, palabras)
-    fecha_cad = _extraer_fecha_caducidad(texto, palabras)
+    fecha_nac = _extraer_fecha_nacimiento(texto_para_regex, palabras)
+    sexo      = _extraer_sexo(texto_para_regex, palabras)
+    fecha_cad = _extraer_fecha_caducidad(texto_para_regex, palabras)
 
     if mrz:
         if not fecha_nac:
@@ -954,32 +959,32 @@ def _extraer_campos_dni(palabras: list, mrz: dict | None, numero_pillow: str | N
 
     return {
         'numero_dni':         numero_dni,
-        'codigo_verificador': _extraer_codigo_verificador(texto, palabras),
+        'codigo_verificador': _extraer_codigo_verificador(texto_para_regex, palabras),
         'apellido_paterno':   apellido_paterno,
         'apellido_materno':   apellido_materno,
         'nombres':            nombres,
         'fecha_nacimiento':   fecha_nac,
         'sexo':               sexo,
-        'estado_civil':       _extraer_estado_civil(texto, palabras),
-        'ubigeo':             _extraer_ubigeo(texto, palabras),
-        'fecha_emision':      _extraer_fecha_emision(texto, palabras),
+        'estado_civil':       _extraer_estado_civil(texto_para_regex, palabras),
+        'ubigeo':             _extraer_ubigeo(texto_para_regex, palabras),
+        'fecha_emision':      _extraer_fecha_emision(texto_para_regex, palabras),
         'fecha_caducidad':    fecha_cad,
     }
 
 
-def _campos_engine_easyocr(img_sin_azul, mrz, numero_pillow) -> dict:
+def _campos_engine_easyocr(img_sin_azul, mrz, numero_pillow, texto_pillow='') -> dict:
     reader = _get_easyocr()
     if not reader:
         return _campos_vacios()
     try:
         resultados = reader.readtext(img_sin_azul)
         palabras = _palabras_desde_easyocr(resultados)
-        return _extraer_campos_dni(palabras, mrz, numero_pillow)
+        return _extraer_campos_dni(palabras, mrz, numero_pillow, texto_extra=texto_pillow)
     except Exception:
         return _campos_vacios()
 
 
-def _campos_engine_paddleocr(img_sin_azul, mrz, numero_pillow) -> dict:
+def _campos_engine_paddleocr(img_sin_azul, mrz, numero_pillow, texto_pillow='') -> dict:
     ocr_inst = _get_paddleocr()
     if not ocr_inst:
         return _campos_vacios()
@@ -990,7 +995,7 @@ def _campos_engine_paddleocr(img_sin_azul, mrz, numero_pillow) -> dict:
         except AttributeError:
             resultados = ocr_inst.ocr(img_sin_azul)
         palabras = _palabras_desde_paddleocr(resultados)
-        return _extraer_campos_dni(palabras, mrz, numero_pillow)
+        return _extraer_campos_dni(palabras, mrz, numero_pillow, texto_extra=texto_pillow)
     except Exception:
         return _campos_vacios()
 
@@ -1060,13 +1065,13 @@ def _procesar_dni(imagen_bytes: bytes) -> dict:
         if not numero_pillow and mrz:
             numero_pillow = mrz.get('numero_dni_mrz')
 
-    campos_tess   = _extraer_campos_dni(palabras_tess, mrz, numero_pillow)
+    campos_tess   = _extraer_campos_dni(palabras_tess, mrz, numero_pillow, texto_extra=texto_pillow)
 
     # Motor 2 — EasyOCR (opcional, pip install easyocr)
-    campos_easy   = _campos_engine_easyocr(img_sin_azul, mrz, numero_pillow)
+    campos_easy   = _campos_engine_easyocr(img_sin_azul, mrz, numero_pillow, texto_pillow)
 
     # Motor 3 — PaddleOCR (opcional, pip install paddleocr paddlepaddle)
-    campos_paddle = _campos_engine_paddleocr(img_sin_azul, mrz, numero_pillow)
+    campos_paddle = _campos_engine_paddleocr(img_sin_azul, mrz, numero_pillow, texto_pillow)
 
     # RENIEC: usa el primer número válido que encuentre algún motor
     numero_final = (campos_tess.get('numero_dni')
