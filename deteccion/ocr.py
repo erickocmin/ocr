@@ -199,6 +199,36 @@ def _eliminar_franja_azul(img_bgr):
     return resultado
 
 
+def _eliminar_encabezado_naranja(img_bgr):
+    """Enmascara con blanco el encabezado naranja/rojo del DNI peruano
+    (banda 'REPÚBLICA DEL PERÚ / RENIEC'). Evita que el OCR lea ese texto
+    como parte de los campos de datos personales."""
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    # Naranja: H=[2-25] — Rojo bajo: H=[0-2] — Rojo alto: H=[168-180]
+    mask = cv2.inRange(hsv, np.array([2, 70, 70]),   np.array([25, 255, 255]))
+    mask |= cv2.inRange(hsv, np.array([0, 70, 70]),  np.array([2, 255, 255]))
+    mask |= cv2.inRange(hsv, np.array([168, 70, 70]), np.array([180, 255, 255]))
+    kernel = np.ones((9, 9), np.uint8)
+    mask = cv2.dilate(mask, kernel, iterations=2)
+    resultado = img_bgr.copy()
+    resultado[mask > 0] = [255, 255, 255]
+    return resultado
+
+
+def _zona_texto_campos(img_bgr):
+    """Recorta la zona de campos de datos del DNI peruano eliminando:
+    franja azul (izq), encabezado (top), foto (der) y MRZ (bottom).
+    Proporciones estimadas para DNI escaneado/fotografiado a ~1800 px de ancho."""
+    h, w = img_bgr.shape[:2]
+    return img_bgr[int(h * 0.13):int(h * 0.80), int(w * 0.13):int(w * 0.68)]
+
+
+def _img_bgr_a_bytes(img_bgr) -> bytes:
+    """Codifica imagen numpy BGR a PNG bytes (para Pillow / pytesseract)."""
+    _, buf = cv2.imencode('.png', img_bgr)
+    return buf.tobytes()
+
+
 def _preprocesar_zona(img_bgr):
     # Canal L del espacio LAB — mejor separación de luminancia que grayscale simple
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
@@ -218,7 +248,11 @@ def _preprocesar_zona(img_bgr):
     _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     adapt = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                    cv2.THRESH_BINARY, 25, 8)
-    return cv2.bitwise_or(otsu, adapt)
+    combined = cv2.bitwise_or(otsu, adapt)
+    # Cierre morfológico pequeño: conecta caracteres fragmentados por el threshold
+    # sin fusionar letras adyacentes (kernel 2x2 conservador a 1800px de ancho)
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    return cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel_close)
 
 
 def _texto_pillow_variante(imagen_bytes: bytes, contrast: float = 2.0,
@@ -367,7 +401,7 @@ def _texto_completo(palabras):
     ordenadas = sorted(palabras, key=lambda p: (p["y"], p["x"]))
     lineas, linea_actual = [], [ordenadas[0]]
     for p in ordenadas[1:]:
-        if abs(p["y"] - linea_actual[-1]["y"]) < 16:
+        if abs(p["y"] - linea_actual[-1]["y"]) < 20:
             linea_actual.append(p)
         else:
             lineas.append(sorted(linea_actual, key=lambda x: x["x"]))
@@ -837,9 +871,16 @@ _RE_FECHA = re.compile(r'(\d{2})[\s\/\-\.](\d{2})[\s\/\-\.](\d{4})')
 def _normalizar_fecha(txt) -> str | None:
     if not txt:
         return None
-    m = _RE_FECHA.search(str(txt))
+    # Corregir sustituciones OCR comunes en dígitos: O→0, I/l/|→1
+    txt_fix = (str(txt)
+               .replace('O', '0').replace('o', '0')
+               .replace('I', '1').replace('l', '1').replace('|', '1'))
+    m = _RE_FECHA.search(txt_fix)
     if m:
-        return f"{m.group(1)}/{m.group(2)}/{m.group(3)}"
+        d, mo, a = m.group(1), m.group(2), m.group(3)
+        # Validación básica de rango para descartar fechas imposibles
+        if 1 <= int(d) <= 31 and 1 <= int(mo) <= 12 and 1900 <= int(a) <= 2100:
+            return f"{d}/{mo}/{a}"
     return None
 
 
@@ -1109,7 +1150,10 @@ def _parsear_texto_linea_a_linea(texto: str) -> dict:
                     elif re.search(r'\bFEMENINO\b|\bF\b', candidato.upper()):
                         campos[campo] = 'F'
                 elif campo == 'ubigeo':
-                    m = re.search(r'\b(\d{6})\b', candidato)
+                    # Corregir O→0, I→1 antes de buscar el código de 6 dígitos
+                    cand_num = (candidato.replace('O', '0').replace('o', '0')
+                                .replace('I', '1').replace('l', '1').replace('|', '1'))
+                    m = re.search(r'\b(\d{6})\b', cand_num)
                     if m:
                         campos[campo] = m.group(1)
                 elif campo == 'estado_civil':
@@ -1117,7 +1161,9 @@ def _parsear_texto_linea_a_linea(texto: str) -> dict:
                     if v and not _es_etiqueta_dni(v):
                         campos[campo] = v
                 elif campo == 'codigo_verificador':
-                    m = re.search(r'\b(\d{1,3})\b', candidato)
+                    cand_num = (candidato.replace('O', '0').replace('o', '0')
+                                .replace('I', '1').replace('l', '1'))
+                    m = re.search(r'\b(\d{1,3})\b', cand_num)
                     if m:
                         campos[campo] = m.group(1)
                 if campo in campos:
@@ -1287,11 +1333,22 @@ def _procesar_dni(imagen_bytes: bytes) -> dict:
     # Franja azul eliminada antes del OCR espacial
     img_sin_azul = _eliminar_franja_azul(img_color)
 
-    # Número DNI vía Pillow (compartido entre los 3 motores — más fiable)
+    # Encabezado naranja/rojo enmascarado (REPÚBLICA DEL PERÚ / RENIEC)
+    # — evita que el header contamine el texto OCR de los campos de datos
+    img_limpia = _eliminar_encabezado_naranja(img_sin_azul)
+
+    # Zona recortada: solo los campos de datos (sin foto, franja azul, header ni MRZ)
+    img_zona = _zona_texto_campos(img_limpia)
+
+    # Número DNI vía Pillow — no cambiar, funciona bien
     numero_pillow = _extraer_numero_multi_variante(imagen_bytes)
 
-    # Texto Pillow: elige el modo PSM y contraste que produce más etiquetas DNI
-    texto_pillow = _texto_pillow_mejor(imagen_bytes)
+    # Texto Pillow sobre la zona de campos (menos ruido de foto/header)
+    texto_zona = _texto_pillow_mejor(_img_bgr_a_bytes(img_zona))
+    # Texto Pillow sobre imagen completa como refuerzo (captura header, MRZ, etc.)
+    texto_full = _texto_pillow_mejor(imagen_bytes)
+    # Combinar: zona primero (más limpia), imagen completa como complemento
+    texto_pillow = '\n'.join(filter(None, [texto_zona, texto_full]))
 
     # MRZ compartido (fastmrz ONNX primero, luego parser propio)
     mrz = _parsear_mrz_fastmrz(imagen_bytes)
@@ -1302,8 +1359,8 @@ def _procesar_dni(imagen_bytes: bytes) -> dict:
             texto_mrz = _mrz_desde_texto_general(texto_pillow) or texto_mrz
         mrz = _parsear_mrz(texto_mrz)
 
-    # Motor 1 — Tesseract
-    img_bin = _preprocesar_zona(img_sin_azul)
+    # Motor 1 — Tesseract (sobre imagen limpia sin encabezado naranja)
+    img_bin = _preprocesar_zona(img_limpia)
     img_bin = _deskew(img_bin)
     datos_ocr = _obtener_datos_ocr(img_bin)
     palabras_tess = _construir_palabras(datos_ocr)
@@ -1318,11 +1375,11 @@ def _procesar_dni(imagen_bytes: bytes) -> dict:
 
     campos_tess   = _extraer_campos_dni(palabras_tess, mrz, numero_pillow, texto_extra=texto_pillow)
 
-    # Motor 2 — EasyOCR (opcional, pip install easyocr)
-    campos_easy   = _campos_engine_easyocr(img_sin_azul, mrz, numero_pillow, texto_pillow)
+    # Motor 2 — EasyOCR sobre zona de campos (menos ruido que imagen completa)
+    campos_easy   = _campos_engine_easyocr(img_zona, mrz, numero_pillow, texto_pillow)
 
-    # Motor 3 — PaddleOCR (opcional, pip install paddleocr paddlepaddle)
-    campos_paddle = _campos_engine_paddleocr(img_sin_azul, mrz, numero_pillow, texto_pillow)
+    # Motor 3 — PaddleOCR
+    campos_paddle = _campos_engine_paddleocr(img_zona, mrz, numero_pillow, texto_pillow)
 
     # RENIEC: usa el primer número válido que encuentre algún motor
     numero_final = (campos_tess.get('numero_dni')
