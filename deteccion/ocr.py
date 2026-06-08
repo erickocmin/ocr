@@ -200,15 +200,24 @@ def _eliminar_franja_azul(img_bgr):
 
 
 def _preprocesar_zona(img_bgr):
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.fastNlMeansDenoising(gray, h=12)
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    # Canal L del espacio LAB — mejor separación de luminancia que grayscale simple
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    gray = lab[:, :, 0]
+
+    # Bilateral filter: preserva bordes mejor que NLMeans, más rápido
+    gray = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
+
+    # CLAHE más agresivo
+    clahe = cv2.createCLAHE(clipLimit=3.5, tileGridSize=(8, 8))
     gray = clahe.apply(gray)
-    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
-    gray = cv2.filter2D(gray, -1, kernel)
+
+    # Unsharp mask para nitidez de texto
+    blur = cv2.GaussianBlur(gray, (0, 0), 1.5)
+    gray = cv2.addWeighted(gray, 1.8, blur, -0.8, 0)
+
     _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     adapt = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                   cv2.THRESH_BINARY, 31, 10)
+                                   cv2.THRESH_BINARY, 25, 8)
     return cv2.bitwise_or(otsu, adapt)
 
 
@@ -223,6 +232,47 @@ def _texto_pillow_variante(imagen_bytes: bytes, contrast: float = 2.0,
     if w < 800:
         img = img.resize((int(w * 800 / w), int(h * 800 / w)), Image.LANCZOS)
     return pytesseract.image_to_string(img, config='--oem 3 --psm 6 -l spa+eng')
+
+
+# Patrones para puntuar cuán bien un texto OCR refleja la estructura del DNI peruano
+_LABEL_SCORE_PATS = [
+    r'PRIMER\s+APELLIDO', r'SEGUNDO\s+APELLIDO', r'APELLIDO\s+PATERNO',
+    r'APELLIDO\s+MATERNO', r'NOMBRES?', r'FECHA\s+DE\s+NACIMIENTO',
+    r'SEXO', r'ESTADO\s+CIVIL', r'UBIGEO', r'EMISI[OÓ]N',
+    r'VENCIMIENTO', r'CADUCIDAD', r'DNI\s+\d{8}',
+]
+
+
+def _texto_pillow_mejor(imagen_bytes: bytes) -> str:
+    """Prueba múltiples combinaciones PSM/contraste y devuelve el texto
+    con la mayor densidad de etiquetas DNI reconocibles."""
+    variantes = [
+        ('--oem 3 --psm 6 -l spa+eng', 2.0, 1.0),
+        ('--oem 3 --psm 4 -l spa+eng', 2.0, 1.0),
+        ('--oem 3 --psm 6 -l spa+eng', 2.8, 1.1),
+        ('--oem 3 --psm 4 -l spa+eng', 1.7, 0.95),
+        ('--oem 3 --psm 6 -l spa+eng', 1.5, 1.0),
+    ]
+    mejor_texto, mejor_score = '', -1
+    base_img = Image.open(io.BytesIO(imagen_bytes)).convert('L')
+    w, h = base_img.size
+    if w < 1200:
+        base_img = base_img.resize((1200, int(h * 1200 / w)), Image.LANCZOS)
+
+    for config, contrast, brightness in variantes:
+        try:
+            img = base_img.copy()
+            if brightness != 1.0:
+                img = ImageEnhance.Brightness(img).enhance(brightness)
+            img = ImageEnhance.Contrast(img).enhance(contrast)
+            img = img.filter(ImageFilter.MedianFilter(size=3))
+            texto = pytesseract.image_to_string(img, config=config)
+            score = sum(1 for p in _LABEL_SCORE_PATS if re.search(p, texto, re.I))
+            if score > mejor_score:
+                mejor_score, mejor_texto = score, texto
+        except Exception:
+            continue
+    return mejor_texto
 
 
 
@@ -962,6 +1012,119 @@ def _palabras_desde_paddleocr(resultados) -> list:
     return palabras
 
 
+def _es_nombre_valido(texto: str) -> bool:
+    """Valida que un string parezca un nombre real en español.
+    Rechaza ruido OCR: strings sin vocales, rachas de consonantes, tokens muy cortos."""
+    if not texto or len(texto.strip()) < 2:
+        return False
+    tokens = texto.strip().split()
+    if not tokens or len(tokens) > 6:
+        return False
+    for t in tokens:
+        if len(t) < 2:
+            return False
+        t_up = t.upper()
+        # Debe tener al menos una vocal
+        if not re.search(r'[AEIOUÁÉÍÓÚÜ]', t_up):
+            return False
+        # No más de 3 consonantes seguidas (SCCS, KTQR = ruido OCR)
+        if re.search(r'[BCDFGHJKLMNPQRSTVWXYZ]{4,}', t_up):
+            return False
+        # No puede ser solo dígitos ni mezcla rara de dígitos+letras
+        if re.search(r'\d', t):
+            return False
+    return True
+
+
+# Mapa ordenado de campos → patrones de etiqueta para el parser secuencial
+_CAMPOS_LABELS = [
+    ('apellido_paterno', [
+        r'PRIMER\s+APELLIDO', r'APELLIDO\s+PATERNO', r'1[Ee][Rr]\.?\s*APELLIDO',
+    ]),
+    ('apellido_materno', [
+        r'SEGUNDO\s+APELLIDO', r'APELLIDO\s+MATERNO', r'2[Dd][Oo]\.?\s*APELLIDO',
+    ]),
+    ('nombres', [r'NOMBRES?\b', r'NOMBRE\s+COMPLETO']),
+    ('fecha_nacimiento', [
+        r'FECHA\s+(?:DE\s+)?NACIMIENTO', r'F\.?\s*NAC\.?', r'NACIMIENTO',
+    ]),
+    ('sexo', [r'\bSEXO\b']),
+    ('estado_civil', [r'ESTADO\s+CIVIL', r'EST\.?\s*CIVIL']),
+    ('ubigeo', [r'\bUBIGEO\b', r'\bUBIG\b']),
+    ('fecha_emision', [
+        r'FECHA\s+(?:DE\s+)?EMISI[OÓ]N', r'EMISI[OÓ]N', r'F\.?\s*EMIS',
+    ]),
+    ('fecha_caducidad', [
+        r'FECHA\s+(?:DE\s+)?(?:VENCIMIENTO|CADUCIDAD)',
+        r'VENCIMIENTO', r'CADUCIDAD', r'F\.?\s*VENC',
+    ]),
+    ('codigo_verificador', [r'C[OÓ]D(?:\.?\s+VERIF|IFICADOR)', r'DIGITO\s+VERIF']),
+]
+
+# Etiquetas a saltar cuando se busca el valor en líneas siguientes
+_RE_CUALQUIER_ETIQUETA = re.compile(
+    '|'.join(p for _, pats in _CAMPOS_LABELS for p in pats),
+    re.IGNORECASE,
+)
+
+
+def _parsear_texto_linea_a_linea(texto: str) -> dict:
+    """Parser secuencial: la línea que sigue a una etiqueta conocida contiene su valor.
+    Estrategia más fiable que regex libre para documentos estructurados como el DNI."""
+    campos: dict = {}
+    lineas = [l.strip() for l in texto.splitlines() if l.strip()]
+
+    for i, linea in enumerate(lineas):
+        linea_up = linea.upper()
+        for campo, patrones in _CAMPOS_LABELS:
+            if campo in campos:
+                continue
+            if not any(re.search(p, linea_up) for p in patrones):
+                continue
+            # Leer hasta 4 líneas adelante buscando el primer valor válido
+            for j in range(i + 1, min(i + 5, len(lineas))):
+                candidato = lineas[j].strip()
+                # Saltar si el candidato es otra etiqueta
+                if _RE_CUALQUIER_ETIQUETA.search(candidato.upper()):
+                    continue
+                # Procesar según tipo de campo
+                if campo in ('apellido_paterno', 'apellido_materno', 'nombres'):
+                    v = _limpiar_valor_nombre(candidato)
+                    if v and _es_nombre_valido(v):
+                        campos[campo] = v
+                elif 'fecha' in campo:
+                    v = _normalizar_fecha(candidato)
+                    if v:
+                        campos[campo] = v
+                    # Si no hay fecha en esta línea, buscar patrón de fecha en la misma
+                    elif re.search(r'\d{2}[/\-\.]\d{2}[/\-\.]\d{4}', candidato):
+                        m = re.search(r'(\d{2}[/\-\.]\d{2}[/\-\.]\d{4})', candidato)
+                        if m:
+                            campos[campo] = _normalizar_fecha(m.group(1))
+                    if campo not in campos:
+                        continue  # Sigue buscando en líneas siguientes
+                elif campo == 'sexo':
+                    if re.search(r'\bMASCULINO\b|\bM\b', candidato.upper()):
+                        campos[campo] = 'M'
+                    elif re.search(r'\bFEMENINO\b|\bF\b', candidato.upper()):
+                        campos[campo] = 'F'
+                elif campo == 'ubigeo':
+                    m = re.search(r'\b(\d{6})\b', candidato)
+                    if m:
+                        campos[campo] = m.group(1)
+                elif campo == 'estado_civil':
+                    v = _limpiar_valor_nombre(candidato)
+                    if v and not _es_etiqueta_dni(v):
+                        campos[campo] = v
+                elif campo == 'codigo_verificador':
+                    m = re.search(r'\b(\d{1,3})\b', candidato)
+                    if m:
+                        campos[campo] = m.group(1)
+                if campo in campos:
+                    break
+    return campos
+
+
 def _campos_vacios() -> dict:
     return {k: None for k in (
         'numero_dni', 'codigo_verificador', 'apellido_paterno', 'apellido_materno',
@@ -972,29 +1135,51 @@ def _campos_vacios() -> dict:
 
 def _extraer_campos_dni(palabras: list, mrz: dict | None, numero_pillow: str | None,
                         texto_extra: str = '') -> dict:
-    """Extrae todos los campos del DNI usando palabras con bounding boxes.
-    texto_extra: texto Pillow del motor Tesseract, usado como fallback para regex.
-    Reutilizable para cualquier motor OCR (Tesseract, EasyOCR, PaddleOCR)."""
-    texto = _texto_completo(palabras) if palabras else ''
-    # Combinar texto espacial + texto Pillow para dar más fuentes a los regex
-    texto_para_regex = '\n'.join(filter(None, [texto, texto_extra]))
+    """Extrae campos del DNI con tres fuentes de extracción en cascada:
+    1. Parser secuencial sobre texto_extra (Pillow) — más fiable para DNI estructurado
+    2. Búsqueda espacial con bounding boxes — complementa con coordenadas
+    3. MRZ — fallback definitivo para fechas y nombres
+    """
+    texto_bboxes = _texto_completo(palabras) if palabras else ''
+    texto_para_regex = '\n'.join(filter(None, [texto_bboxes, texto_extra]))
 
     if not palabras and not texto_para_regex:
         c = _campos_vacios()
         c['numero_dni'] = numero_pillow
         return c
 
+    # ── 1. Parser secuencial: combinar resultados de Pillow + texto bboxes ──
+    seq_pillow = _parsear_texto_linea_a_linea(texto_extra) if texto_extra else {}
+    seq_bboxes = _parsear_texto_linea_a_linea(texto_bboxes) if texto_bboxes else {}
+    # Pillow tiene prioridad; bboxes llena los huecos
+    seq = {**seq_bboxes, **seq_pillow}
+
+    # ── 2. Número DNI (Pillow es más fiable, ya viene como número_pillow) ──
     lineas = [l.strip() for l in texto_para_regex.splitlines() if l.strip()]
-
-    numero_dni = _extraer_numero_simple(lineas)
+    numero_dni = numero_pillow
     if not numero_dni:
-        numero_dni = _extraer_numero_dni_spatial(texto, palabras, None)
+        numero_dni = _extraer_numero_simple(lineas)
     if not numero_dni:
-        numero_dni = numero_pillow
+        numero_dni = _extraer_numero_dni_spatial(texto_bboxes, palabras, None)
 
-    apellido_paterno, apellido_materno = _extraer_apellidos(texto_para_regex, palabras)
-    nombres = _extraer_nombres(texto_para_regex, palabras)
+    # ── 3. Nombres y apellidos: secuencial primero, espacial como refuerzo ──
+    apellido_paterno = seq.get('apellido_paterno')
+    apellido_materno = seq.get('apellido_materno')
+    nombres          = seq.get('nombres')
 
+    if not apellido_paterno or not apellido_materno:
+        ap_sp, am_sp = _extraer_apellidos(texto_para_regex, palabras)
+        if not apellido_paterno and ap_sp and _es_nombre_valido(ap_sp):
+            apellido_paterno = ap_sp
+        if not apellido_materno and am_sp and _es_nombre_valido(am_sp):
+            apellido_materno = am_sp
+
+    if not nombres:
+        nombres_sp = _extraer_nombres(texto_para_regex, palabras)
+        if nombres_sp and _es_nombre_valido(nombres_sp):
+            nombres = nombres_sp
+
+    # ── 4. MRZ como fallback de última instancia ─────────────────────────────
     if mrz:
         ap_mrz = mrz.get('apellido_paterno_mrz')
         am_mrz = mrz.get('apellido_materno_mrz')
@@ -1006,29 +1191,31 @@ def _extraer_campos_dni(palabras: list, mrz: dict | None, numero_pillow: str | N
         if not nombres and _nombre_mrz_valido(n_mrz):
             nombres = n_mrz
 
-    fecha_nac = _extraer_fecha_nacimiento(texto_para_regex, palabras)
-    sexo      = _extraer_sexo(texto_para_regex, palabras)
-    fecha_cad = _extraer_fecha_caducidad(texto_para_regex, palabras)
+    # ── 5. Fechas y campos adicionales ───────────────────────────────────────
+    fecha_nac    = seq.get('fecha_nacimiento') or _extraer_fecha_nacimiento(texto_para_regex, palabras)
+    sexo         = seq.get('sexo')             or _extraer_sexo(texto_para_regex, palabras)
+    fecha_cad    = seq.get('fecha_caducidad')  or _extraer_fecha_caducidad(texto_para_regex, palabras)
+    estado_civil = seq.get('estado_civil')     or _extraer_estado_civil(texto_para_regex, palabras)
+    ubigeo       = seq.get('ubigeo')           or _extraer_ubigeo(texto_para_regex, palabras)
+    fecha_emis   = seq.get('fecha_emision')    or _extraer_fecha_emision(texto_para_regex, palabras)
+    cod_verif    = seq.get('codigo_verificador') or _extraer_codigo_verificador(texto_para_regex, palabras)
 
     if mrz:
-        if not fecha_nac:
-            fecha_nac = mrz.get('fecha_nacimiento_mrz')
-        if not sexo:
-            sexo = mrz.get('sexo_mrz')
-        if not fecha_cad:
-            fecha_cad = mrz.get('fecha_caducidad_mrz')
+        if not fecha_nac: fecha_nac = mrz.get('fecha_nacimiento_mrz')
+        if not sexo:      sexo      = mrz.get('sexo_mrz')
+        if not fecha_cad: fecha_cad = mrz.get('fecha_caducidad_mrz')
 
     return {
         'numero_dni':         numero_dni,
-        'codigo_verificador': _extraer_codigo_verificador(texto_para_regex, palabras),
+        'codigo_verificador': cod_verif,
         'apellido_paterno':   apellido_paterno,
         'apellido_materno':   apellido_materno,
         'nombres':            nombres,
         'fecha_nacimiento':   fecha_nac,
         'sexo':               sexo,
-        'estado_civil':       _extraer_estado_civil(texto_para_regex, palabras),
-        'ubigeo':             _extraer_ubigeo(texto_para_regex, palabras),
-        'fecha_emision':      _extraer_fecha_emision(texto_para_regex, palabras),
+        'estado_civil':       estado_civil,
+        'ubigeo':             ubigeo,
+        'fecha_emision':      fecha_emis,
         'fecha_caducidad':    fecha_cad,
     }
 
@@ -1103,8 +1290,8 @@ def _procesar_dni(imagen_bytes: bytes) -> dict:
     # Número DNI vía Pillow (compartido entre los 3 motores — más fiable)
     numero_pillow = _extraer_numero_multi_variante(imagen_bytes)
 
-    # Texto Pillow para MRZ y texto_raw
-    texto_pillow = _texto_pillow_variante(imagen_bytes, 2.0, 1.0)
+    # Texto Pillow: elige el modo PSM y contraste que produce más etiquetas DNI
+    texto_pillow = _texto_pillow_mejor(imagen_bytes)
 
     # MRZ compartido (fastmrz ONNX primero, luego parser propio)
     mrz = _parsear_mrz_fastmrz(imagen_bytes)
