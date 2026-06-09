@@ -7,5 +7,4 @@ opencv-python>=4.8.0
 requests>=2.31.0
 fastmrz>=1.0.0
 easyocr>=1.7.0
-paddleocr>=2.7.0
-paddlepaddle
+python-doctr[torch]>=1.0.0

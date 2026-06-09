@@ -51,7 +51,7 @@ class LoginAdminView(APIView):
 class DetectarDocumentoView(APIView):
     """
     POST /api/deteccion/detectar/
-    Recibe una imagen y el tipo de documento (DNI o CARNET_EXTRANJERIA).
+    Recibe ambas caras de un DNI azul o DNI electronico.
     Devuelve los campos detectados mediante OCR.
     Requiere autenticación con token de admin.
     """
@@ -63,19 +63,25 @@ class DetectarDocumentoView(APIView):
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        imagen_file = serializer.validated_data['imagen']
+        imagen_frente_file = (
+            serializer.validated_data.get('imagen_frente')
+            or serializer.validated_data.get('imagen')
+        )
+        imagen_reverso_file = serializer.validated_data.get('imagen_reverso')
         tipo_documento = serializer.validated_data['tipo_documento']
 
         # Validar tamaño máximo: 10 MB
-        if imagen_file.size > 10 * 1024 * 1024:
-            return Response(
-                {'error': 'La imagen no puede superar los 10 MB.'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        for imagen_file in (imagen_frente_file, imagen_reverso_file):
+            if imagen_file.size > 10 * 1024 * 1024:
+                return Response(
+                    {'error': 'Cada imagen no puede superar los 10 MB.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
         try:
-            imagen_bytes = imagen_file.read()
-            resultado = ocr.detectar(imagen_bytes, tipo_documento)
+            frente_bytes = imagen_frente_file.read()
+            reverso_bytes = imagen_reverso_file.read()
+            resultado = ocr.detectar(frente_bytes, tipo_documento, reverso_bytes)
         except RuntimeError as exc:
             return Response({'error': str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
         except Exception as exc:
