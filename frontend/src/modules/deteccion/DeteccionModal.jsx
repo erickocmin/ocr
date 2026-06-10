@@ -21,28 +21,26 @@ const LABELS_DNI_ELECTRONICO = {
   ...LABELS_DNI,
   direccion:        'Dirección',
   distrito:         'Departamento/Provincia/Distrito',
-  cuarto_nivel:     'Cuarto Nivel',
-  grupo_votacion:   'Grupo de Votación',
-  donacion_organos: 'Donación de Órganos',
-  grupo_sanguineo:  'Grupo Sanguíneo',
+  // cuarto_nivel:     'Cuarto Nivel',
+  // grupo_votacion:   'Grupo de Votación',
+  // donacion_organos: 'Donación de Órganos',
+  // grupo_sanguineo:  'Grupo Sanguíneo',
 };
 
 const INITIAL_LOGIN = { username: '', password: '' };
 
 const MOTORES = [
-  { key: 'votado',    label: 'Votado',    color: '#1a4fa0', descripcion: 'Consenso de los motores' },
-  { key: 'tesseract', label: 'Tesseract', color: '#555',    descripcion: null },
-  { key: 'easyocr',   label: 'EasyOCR',  color: '#1a7a4a', descripcion: null },
-  { key: 'doctr',     label: 'doctr',    color: '#8b1fa0', descripcion: null },
+  { key: 'votado',    label: 'Resultado', color: '#1a4fa0', descripcion: 'Campos consolidados' },
+  { key: 'doctr',     label: 'doctr',      color: '#1a7a4a', descripcion: 'Motor principal' },
+  { key: 'paddleocr', label: 'PaddleOCR',  color: '#8b1fa0', descripcion: 'Fallback opcional' },
 ];
 
 // Fases de progreso con duración estimada acumulada en segundos
 const FASES_PROGRESO = [
-  { hasta: 5,   pct: 5,  label: 'Subiendo y decodificando imágenes...' },
-  { hasta: 18,  pct: 20, label: 'OCR base con Tesseract...' },
-  { hasta: 45,  pct: 55, label: 'Motores de IA en paralelo (EasyOCR + doctr)...' },
-  { hasta: 65,  pct: 80, label: 'Extracción campo a campo y coherencia...' },
-  { hasta: 80,  pct: 92, label: 'Combinando resultados y validando...' },
+  { hasta: 2,   pct: 15, label: 'Subiendo y preparando imágenes...' },
+  { hasta: 5,   pct: 50, label: 'Leyendo campos con doctr...' },
+  { hasta: 8,   pct: 78, label: 'Validando claves esperadas...' },
+  { hasta: 10,  pct: 92, label: 'Aplicando fallback si falta información...' },
   { hasta: Infinity, pct: 97, label: 'Finalizando detección...' },
 ];
 
@@ -65,7 +63,7 @@ function cellStyle(val) {
 }
 
 /** Comprime y redimensiona una imagen usando Canvas API antes de subirla. */
-async function comprimirImagen(file, maxWidth = 1800, quality = 0.88) {
+async function comprimirImagen(file, maxWidth = 1200, quality = 0.82) {
   // Si ya es pequeña y es JPEG/WebP, no recomprimir
   if (file.size < 800_000 && (file.type === 'image/jpeg' || file.type === 'image/webp')) {
     return file;
@@ -136,7 +134,7 @@ function LoaderDeteccion({ elapsed }) {
       </div>
 
       <p style={{ margin: 0, color: '#999', fontSize: '0.79rem' }}>
-        {elapsed}s transcurridos · estimado: ~60–80s
+        {elapsed}s transcurridos
       </p>
     </div>
   );
@@ -427,7 +425,7 @@ export function DeteccionModal({ isOpen, onClose, onApply }) {
       {!loading && resultado && (
         <div>
           <p style={{ margin: '0 0 12px', color: 'var(--text-muted, #666)', fontSize: '0.83rem' }}>
-            Compara los motores y usa los datos del que mejor detectó.
+            Revisa los campos detectados y usa el resultado que corresponda.
           </p>
 
           <div style={{ overflowX: 'auto' }}>

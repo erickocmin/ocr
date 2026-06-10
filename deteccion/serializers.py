@@ -19,10 +19,10 @@ class DetectarSerializer(serializers.Serializer):
         reverso = attrs.get('imagen_reverso')
         if not frente:
             raise serializers.ValidationError({
-                'imagen_frente': 'Sube la imagen frontal del documento.'
+                'imagen_frente': 'Sube la imagen frontal del documento de identidad.'
             })
         if not reverso:
             raise serializers.ValidationError({
-                'imagen_reverso': 'Sube la imagen posterior del documento.'
+                'imagen_reverso': 'Sube la imagen posterior del documento de identidad.'
             })
         return attrs
